@@ -247,6 +247,21 @@ def bulk_apply(assignments: dict, rows_by_id: dict) -> dict:
     }
 
 
+def bulk_apply_summary(count: int, cost: float) -> dict:
+    """Record a bulk apply when matching was done in SQL (no row set in hand).
+
+    In DRY_RUN, just acknowledges the batch by its aggregate count/cost. Live
+    execution hands the rule set to a Databricks job that does the per-product
+    batched writes — the app does not write thousands of resources inline.
+    """
+    if not DRY_RUN:
+        raise NotImplementedError(
+            "Live bulk writes run as a Databricks job; not enabled. Implement the "
+            "per-product batched writer before setting TAG_GOVERNANCE_DRY_RUN=false."
+        )
+    return {"status": "BULK_DRY_RUN", "count": count, "total_cost": cost}
+
+
 def approve(plan: TagPlan) -> dict:
     """Approve & apply the plan.
 

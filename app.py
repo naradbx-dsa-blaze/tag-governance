@@ -388,13 +388,8 @@ with tab_bulk:
     if not tag_keys:
         st.warning("Choose your chargeback keys in the sidebar first.")
     else:
-        # full untagged set (attributes the rules match on)
-        rows_df = db.run_query(queries.untagged_workloads(days, tag_keys, workspaces))
-        rows = rows_df.to_dict("records") if not rows_df.empty else []
-        rows_by_id = {r["workload_id"]: r for r in rows}
-        total_untagged = sum(float(r.get("untagged_cost") or 0) for r in rows)
-        st.markdown(f"**{len(rows):,} untagged workloads** · "
-                    f"{fmt_money(total_untagged)} unattributed in scope")
+        st.caption("Rules are evaluated **in the warehouse** — the app never pulls the "
+                   "full workload set, so this scales to tens of thousands of workloads.")
 
         n_rules = st.number_input("How many rules?", 1, 20, 3, key="n_rules")
         st.markdown("##### Rules")
@@ -420,71 +415,72 @@ with tab_bulk:
                         tags[k.strip()] = v.strip()
             rules.append({"field": field, "op": op, "value": value.strip(), "tags": tags})
 
-        if st.button("Preview impact", type="primary"):
-            st.session_state["bulk_preview"] = tagging.evaluate_rules(rules, rows)
+        valid_rules = [r for r in rules if r["value"] and r["tags"]]
+        if st.button("Preview impact", type="primary", disabled=not valid_rules):
+            st.session_state["bulk_rules"] = valid_rules
 
-        ev = st.session_state.get("bulk_preview")
-        if ev:
+        rset = st.session_state.get("bulk_rules")
+        if rset:
+            # all evaluated in SQL — only aggregates + a 50-row sample come back
+            impact = db.run_query(queries.bulk_rule_impact(days, tag_keys, rset, workspaces))
+            perrule = db.run_query(queries.bulk_rule_per_rule(days, tag_keys, rset, workspaces))
+            sample = db.run_query(queries.bulk_rule_sample(days, tag_keys, rset, workspaces))
+
+            irow = impact.iloc[0] if not impact.empty else pd.Series(dtype="float64")
+            total_unt = float(irow.get("total_untagged_cost") or 0)
+            matched_cnt = int(irow.get("matched_count") or 0)
+            matched_cost = float(irow.get("matched_cost") or 0)
+
             st.markdown("---")
             m1, m2, m3 = st.columns(3)
-            kpi_card(m1, "Workloads matched", f"{ev['matched_count']:,}", "neutral",
-                     f"of {len(rows):,} untagged")
-            kpi_card(m2, "Spend now attributable", fmt_money(ev["matched_cost"]),
-                     "warn", f"{100*ev['matched_cost']/total_untagged:.0f}% of untagged"
-                     if total_untagged else "")
-            kpi_card(m3, "Conflicts", f"{len(ev['conflicts']):,}",
-                     "bad" if ev["conflicts"] else "neutral", "earlier rule wins")
+            kpi_card(m1, "Workloads matched", f"{matched_cnt:,}", "neutral",
+                     f"of {int(irow.get('total_untagged') or 0):,} untagged")
+            kpi_card(m2, "Spend now attributable", fmt_money(matched_cost), "warn",
+                     f"{100*matched_cost/total_unt:.0f}% of untagged" if total_unt else "")
+            kpi_card(m3, "Avg $/workload",
+                     fmt_money(matched_cost / matched_cnt) if matched_cnt else "—",
+                     "neutral", "matched")
 
-            # per-rule coverage
-            st.markdown("**Coverage by rule**")
+            # per-rule coverage (first-match)
+            st.markdown("**Coverage by rule** (first matching rule wins)")
+            pr_map = {int(r["first_rule"]): r for _, r in perrule.iterrows()} \
+                if not perrule.empty else {}
             cov = pd.DataFrame([
                 {"Rule": f"{i+1}. {r['field']} {r['op']} '{r['value']}'",
                  "Assigns": ", ".join(f"{k}={v}" for k, v in r["tags"].items()),
-                 "Workloads tagged": ev["per_rule"].get(i, 0)}
-                for i, r in enumerate(rules) if r["value"] and r["tags"]
+                 "Workloads": int(pr_map.get(i, {}).get("workloads", 0)),
+                 "Cost": fmt_money(pr_map.get(i, {}).get("cost", 0))}
+                for i, r in enumerate(rset)
             ])
-            if not cov.empty:
-                st.dataframe(cov, hide_index=True, use_container_width=True)
+            st.dataframe(cov, hide_index=True, use_container_width=True)
 
-            # sample of what gets tagged
-            st.markdown("**Sample of matched workloads** (first 50)")
-            sample = []
-            for wid, tags in list(ev["assignments"].items())[:50]:
-                r = rows_by_id.get(wid, {})
-                sample.append({
-                    "Product": PRODUCT_LABELS.get(r.get("product"), r.get("product")),
-                    "Workload": r.get("workload_name") or wid,
-                    "Owner": r.get("owner") or "— unknown —",
-                    "Will get tags": ", ".join(f"{k}={v}" for k, v in tags.items()),
-                    "Cost": fmt_money(r.get("untagged_cost")),
-                })
-            if sample:
-                st.dataframe(pd.DataFrame(sample), hide_index=True,
-                             use_container_width=True, height=380)
-
-            if ev["conflicts"]:
-                with st.expander(f"⚠️ {len(ev['conflicts'])} conflicts "
-                                 "(earlier rule kept its value)"):
-                    cdf = pd.DataFrame([
-                        {"Workload": rows_by_id.get(w, {}).get("workload_name") or w,
-                         "Key": k, "Kept": kept, "Ignored": dropped,
-                         "From rule": idx + 1}
-                        for (w, k, kept, dropped, idx) in ev["conflicts"][:200]
-                    ])
-                    st.dataframe(cdf, hide_index=True, use_container_width=True)
+            # sample
+            st.markdown("**Sample of matched workloads** (top 50 by cost)")
+            if not sample.empty:
+                disp = sample.copy()
+                disp["Product"] = disp["product"].map(lambda p: PRODUCT_LABELS.get(p, p))
+                disp["Workload"] = disp["workload_name"].fillna("—")
+                disp["Owner"] = disp["owner"].fillna("— unknown —")
+                disp["Will get tags"] = disp["first_rule"].map(
+                    lambda i: ", ".join(f"{k}={v}" for k, v in rset[int(i)]["tags"].items())
+                    if 0 <= int(i) < len(rset) else "")
+                disp["Cost"] = disp["cost"].map(fmt_money)
+                st.dataframe(disp[["Product", "Workload", "Owner", "Will get tags", "Cost"]],
+                             hide_index=True, use_container_width=True, height=380)
 
             # apply
             st.markdown("---")
             if tagging.DRY_RUN:
-                st.info("🔒 Dry-run: applying **records** the batch and reports "
-                        "per-workload results — it does **not** modify resources. "
-                        "Live runs execute as a Databricks job (batched, per-product).")
-            if st.button(f"Apply to {ev['matched_count']:,} workloads "
+                st.info("🔒 Dry-run: applying **records** the batch — it does **not** modify "
+                        "resources. Live runs execute as a **Databricks job** (batched, "
+                        "concurrent, per-product) so writing thousands scales and survives "
+                        "partial failure.")
+            if st.button(f"Apply to {matched_cnt:,} workloads "
                          f"{'(dry-run)' if tagging.DRY_RUN else ''}",
-                         type="primary", disabled=ev["matched_count"] == 0):
-                res = tagging.bulk_apply(ev["assignments"], rows_by_id)
-                st.success(f"✅ {res['status']}: {res['count']:,} workloads, "
-                           f"{fmt_money(res['total_cost'])} now attributable "
+                         type="primary", disabled=matched_cnt == 0):
+                res = tagging.bulk_apply_summary(matched_cnt, matched_cost)
+                st.success(f"✅ {res['status']}: {matched_cnt:,} workloads, "
+                           f"{fmt_money(matched_cost)} now attributable "
                            f"{'(recorded, nothing modified)' if tagging.DRY_RUN else ''}.")
 
 # ============================================================================= ABOUT

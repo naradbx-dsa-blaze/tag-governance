@@ -158,6 +158,126 @@ LIMIT {limit}
 """
 
 
+def _rule_sql_predicate(rule):
+    """SQL boolean for one rule's match condition over the workload aggregate."""
+    col = {"owner": "owner", "workspace": "workspace_id",
+           "product": "product", "name": "workload_name"}[rule["field"]]
+    val = rule["value"].replace("'", "''")
+    c = f"lower(coalesce({col},''))"
+    if rule["op"] == "equals":
+        return f"{c} = lower('{val}')"
+    if rule["op"] == "contains":
+        return f"{c} LIKE lower('%{val}%')"
+    if rule["op"] == "matches":  # glob -> LIKE
+        like = val.replace("%", "\\%").replace("_", "\\_").replace("*", "%").replace("?", "_")
+        return f"{c} LIKE lower('{like}')"
+    return "false"
+
+
+def bulk_rule_impact(days, tag_keys, rules, workspaces=None):
+    """Evaluate rules ENTIRELY in SQL — returns aggregate impact, no row dump.
+
+    A workload is 'covered' if it matches ANY rule. This computes coverage at the
+    warehouse so the app never pulls the (potentially 50k+) full row set. Earlier
+    rules win on conflict, but for COVERAGE/COST totals only first-match matters,
+    so a single OR over the rules is exact for the headline numbers.
+    """
+    valid = [r for r in rules if r.get("value") and r.get("tags")]
+    if not valid:
+        return None
+    any_match = " OR ".join(f"({_rule_sql_predicate(r)})" for r in valid)
+    # per-rule first-match coverage via a CASE priority ladder
+    ladder = "\n".join(
+        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    return f"""
+WITH wl AS (
+  SELECT workload_id,
+         MAX(workspace_id)  AS workspace_id,
+         MAX(workload_name) AS workload_name,
+         MAX(owner)         AS owner,
+         product,
+         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         SUM(list_cost)     AS cost
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+),
+untagged AS (SELECT * FROM wl WHERE is_untagged AND cost > 0),
+matched AS (
+  SELECT *,
+         CASE
+{ladder}
+           ELSE -1 END AS first_rule
+  FROM untagged
+  WHERE {any_match}
+)
+SELECT
+  (SELECT COUNT(*) FROM untagged)                    AS total_untagged,
+  (SELECT ROUND(SUM(cost),0) FROM untagged)          AS total_untagged_cost,
+  COUNT(*)                                           AS matched_count,
+  ROUND(SUM(cost),0)                                 AS matched_cost
+FROM matched
+"""
+
+
+def bulk_rule_per_rule(days, tag_keys, rules, workspaces=None):
+    """Per-rule first-match coverage (how many workloads each rule newly tags)."""
+    valid = [r for r in rules if r.get("value") and r.get("tags")]
+    if not valid:
+        return None
+    ladder = "\n".join(
+        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    return f"""
+WITH wl AS (
+  SELECT workload_id, product,
+         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         SUM(list_cost) AS cost,
+         MAX(owner) AS owner, MAX(workspace_id) AS workspace_id, MAX(workload_name) AS workload_name
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+),
+matched AS (
+  SELECT cost, CASE
+{ladder}
+           ELSE -1 END AS first_rule
+  FROM wl WHERE is_untagged AND cost > 0
+)
+SELECT first_rule, COUNT(*) AS workloads, ROUND(SUM(cost),0) AS cost
+FROM matched WHERE first_rule >= 0
+GROUP BY first_rule ORDER BY first_rule
+"""
+
+
+def bulk_rule_sample(days, tag_keys, rules, workspaces=None, limit=50):
+    """A small sample of matched workloads, with which rule (priority) tags each."""
+    valid = [r for r in rules if r.get("value") and r.get("tags")]
+    if not valid:
+        return None
+    any_match = " OR ".join(f"({_rule_sql_predicate(r)})" for r in valid)
+    ladder = "\n".join(
+        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    return f"""
+WITH wl AS (
+  SELECT workload_id, product,
+         MAX(workspace_id) AS workspace_id, MAX(workload_name) AS workload_name, MAX(owner) AS owner,
+         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         SUM(list_cost) AS cost
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+)
+SELECT product, workload_name, owner, ROUND(cost,0) AS cost,
+       CASE
+{ladder}
+         ELSE -1 END AS first_rule
+FROM wl
+WHERE is_untagged AND cost > 0 AND ({any_match})
+ORDER BY cost DESC
+LIMIT {limit}
+"""
+
+
 def workspace_options(days):
     """All workspaces in the table (for the sidebar picker), ranked by spend, with names."""
     return f"""

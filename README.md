@@ -45,6 +45,18 @@ system.access.workspaces_latest                (pre-aggregated)      (sub-second
 - The app computes "untagged" at query time via `NOT arrays_overlap(tag_keys, <your keys>)`,
   so the table is **key-agnostic** — users pick any keys at runtime.
 
+### Scaling (tested)
+
+- **Materialization** collapses millions of raw usage rows to one row per workload-day,
+  so the dashboard reads a small table (sub-second over 30 days).
+- **Bulk rules are evaluated in the warehouse**, not the app. Even at **50k+ untagged
+  workloads** the app only pulls aggregates + a 50-row sample (1–2s), never the full set —
+  so adding workloads doesn't bloat the client payload or slow the browser. (Verified on a
+  50,662-workload fleet.)
+- **Live bulk writes run as a Databricks job** (batched, concurrent, per-product), not
+  inline in the request — so writing thousands of resources scales and survives partial
+  failure with per-workload results.
+
 ### Files
 
 | File | Purpose |
