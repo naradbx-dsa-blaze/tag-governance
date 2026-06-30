@@ -1,0 +1,16 @@
+# Databricks bundle local state & auth
+.databricks/
+*.env
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

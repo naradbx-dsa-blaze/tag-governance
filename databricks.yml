@@ -1,0 +1,76 @@
+bundle:
+  name: tag-governance
+
+# ----------------------------------------------------------------------------
+# To deploy into a NEW account (e.g. Bayada), a customer only changes these two
+# values — either here, with --var on the CLI, or per-target below.
+#   warehouse_id : any SQL warehouse in THEIR account
+#   summary_table: catalog.schema.table the app/job own (their UC)
+# Everything else (billing data, workspace list) is discovered automatically
+# because system.billing.usage is account-wide.
+# ----------------------------------------------------------------------------
+variables:
+  warehouse_id:
+    description: "SQL warehouse the app and refresh job run on"
+    default: 1c1ccdae9778e4ba
+  summary_table:
+    description: "Fully-qualified UC table for the pre-aggregated summary"
+    default: users.narasimha_kamathardi.tag_governance_workload_daily
+
+resources:
+  jobs:
+    tag-governance-refresh:
+      name: tag-governance-refresh
+      description: "Daily rebuild of the pre-aggregated untagged-workload summary table"
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"   # 06:00 daily
+        timezone_id: "America/New_York"
+      parameters:
+        - name: summary_table
+          default: ${var.summary_table}
+      tasks:
+        - task_key: materialize
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./materialize.sql
+            parameters:
+              summary_table: ${var.summary_table}
+
+  apps:
+    tag-governance:
+      name: tag-governance
+      source_code_path: .
+      description: "Scan untagged Databricks workloads by cost and tag them in-place for chargeback"
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+      config:
+        command:
+          - sh
+          - -c
+          - streamlit run app.py --server.port ${DATABRICKS_APP_PORT:-8000} --server.address 0.0.0.0
+        env:
+          - name: DATABRICKS_WAREHOUSE_ID
+            value_from: sql-warehouse
+          - name: TAG_GOVERNANCE_SUMMARY_TABLE
+            value: ${var.summary_table}
+          - name: STREAMLIT_SERVER_ENABLE_CORS
+            value: "false"
+          - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
+            value: "false"
+          - name: TAG_GOVERNANCE_DRY_RUN
+            value: "true"
+
+targets:
+  dev:
+    default: true
+  # Example customer target — Bayada copies this, sets their host + values.
+  # bayada:
+  #   workspace:
+  #     host: https://<bayada-workspace>.cloud.databricks.com
+  #   variables:
+  #     warehouse_id: <their-warehouse-id>
+  #     summary_table: <their_catalog>.<their_schema>.tag_governance_workload_daily
