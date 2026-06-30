@@ -171,7 +171,8 @@ kpi_card(c4, "📦 Untagged workloads", f"{int(nwk):,}" if pd.notna(nwk) else "�
 
 st.divider()
 
-tab_scan, tab_tag, tab_about = st.tabs(["📊  Scan", "🏷️  Tag & Verify", "ℹ️  How it works"])
+tab_scan, tab_tag, tab_bulk, tab_about = st.tabs(
+    ["📊  Scan", "🏷️  Tag & Verify", "⚡  Bulk tag (rules)", "ℹ️  How it works"])
 
 # ============================================================================= SCAN
 with tab_scan:
@@ -377,6 +378,115 @@ with tab_tag:
             attributed = sum(v["cost"] for v in approvals.values())
             st.metric("Spend now attributable", fmt_money(attributed))
 
+# ============================================================================= BULK
+with tab_bulk:
+    st.subheader("Tag thousands of workloads with a few rules")
+    st.caption("Each rule attributes every matching workload at once. Earlier rules "
+               "win on conflict. Preview the full impact before applying — nothing "
+               "is mutated in dry-run.")
+
+    if not tag_keys:
+        st.warning("Choose your chargeback keys in the sidebar first.")
+    else:
+        # full untagged set (attributes the rules match on)
+        rows_df = db.run_query(queries.untagged_workloads(days, tag_keys, workspaces))
+        rows = rows_df.to_dict("records") if not rows_df.empty else []
+        rows_by_id = {r["workload_id"]: r for r in rows}
+        total_untagged = sum(float(r.get("untagged_cost") or 0) for r in rows)
+        st.markdown(f"**{len(rows):,} untagged workloads** · "
+                    f"{fmt_money(total_untagged)} unattributed in scope")
+
+        n_rules = st.number_input("How many rules?", 1, 20, 3, key="n_rules")
+        st.markdown("##### Rules")
+        st.caption("Match field · operator · value  →  tags to assign "
+                   "(format `key=value`, comma-separated).")
+
+        rules = []
+        for i in range(int(n_rules)):
+            c0, c1, c2, c3 = st.columns([1.1, 1, 1.6, 2.3])
+            field = c0.selectbox("Field", list(tagging.RULE_FIELDS.keys()),
+                                 key=f"f{i}", label_visibility="collapsed")
+            op = c1.selectbox("Op", tagging.RULE_OPS, key=f"o{i}",
+                              label_visibility="collapsed")
+            value = c2.text_input("Value", key=f"v{i}", label_visibility="collapsed",
+                                  placeholder="e.g. data-eng@bayada.com")
+            tagstr = c3.text_input("Tags", key=f"t{i}", label_visibility="collapsed",
+                                   placeholder="team=data-eng, cost_center=BI")
+            tags = {}
+            for pair in tagstr.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    if k.strip() and v.strip():
+                        tags[k.strip()] = v.strip()
+            rules.append({"field": field, "op": op, "value": value.strip(), "tags": tags})
+
+        if st.button("Preview impact", type="primary"):
+            st.session_state["bulk_preview"] = tagging.evaluate_rules(rules, rows)
+
+        ev = st.session_state.get("bulk_preview")
+        if ev:
+            st.markdown("---")
+            m1, m2, m3 = st.columns(3)
+            kpi_card(m1, "Workloads matched", f"{ev['matched_count']:,}", "neutral",
+                     f"of {len(rows):,} untagged")
+            kpi_card(m2, "Spend now attributable", fmt_money(ev["matched_cost"]),
+                     "warn", f"{100*ev['matched_cost']/total_untagged:.0f}% of untagged"
+                     if total_untagged else "")
+            kpi_card(m3, "Conflicts", f"{len(ev['conflicts']):,}",
+                     "bad" if ev["conflicts"] else "neutral", "earlier rule wins")
+
+            # per-rule coverage
+            st.markdown("**Coverage by rule**")
+            cov = pd.DataFrame([
+                {"Rule": f"{i+1}. {r['field']} {r['op']} '{r['value']}'",
+                 "Assigns": ", ".join(f"{k}={v}" for k, v in r["tags"].items()),
+                 "Workloads tagged": ev["per_rule"].get(i, 0)}
+                for i, r in enumerate(rules) if r["value"] and r["tags"]
+            ])
+            if not cov.empty:
+                st.dataframe(cov, hide_index=True, use_container_width=True)
+
+            # sample of what gets tagged
+            st.markdown("**Sample of matched workloads** (first 50)")
+            sample = []
+            for wid, tags in list(ev["assignments"].items())[:50]:
+                r = rows_by_id.get(wid, {})
+                sample.append({
+                    "Product": PRODUCT_LABELS.get(r.get("product"), r.get("product")),
+                    "Workload": r.get("workload_name") or wid,
+                    "Owner": r.get("owner") or "— unknown —",
+                    "Will get tags": ", ".join(f"{k}={v}" for k, v in tags.items()),
+                    "Cost": fmt_money(r.get("untagged_cost")),
+                })
+            if sample:
+                st.dataframe(pd.DataFrame(sample), hide_index=True,
+                             use_container_width=True, height=380)
+
+            if ev["conflicts"]:
+                with st.expander(f"⚠️ {len(ev['conflicts'])} conflicts "
+                                 "(earlier rule kept its value)"):
+                    cdf = pd.DataFrame([
+                        {"Workload": rows_by_id.get(w, {}).get("workload_name") or w,
+                         "Key": k, "Kept": kept, "Ignored": dropped,
+                         "From rule": idx + 1}
+                        for (w, k, kept, dropped, idx) in ev["conflicts"][:200]
+                    ])
+                    st.dataframe(cdf, hide_index=True, use_container_width=True)
+
+            # apply
+            st.markdown("---")
+            if tagging.DRY_RUN:
+                st.info("🔒 Dry-run: applying **records** the batch and reports "
+                        "per-workload results — it does **not** modify resources. "
+                        "Live runs execute as a Databricks job (batched, per-product).")
+            if st.button(f"Apply to {ev['matched_count']:,} workloads "
+                         f"{'(dry-run)' if tagging.DRY_RUN else ''}",
+                         type="primary", disabled=ev["matched_count"] == 0):
+                res = tagging.bulk_apply(ev["assignments"], rows_by_id)
+                st.success(f"✅ {res['status']}: {res['count']:,} workloads, "
+                           f"{fmt_money(res['total_cost'])} now attributable "
+                           f"{'(recorded, nothing modified)' if tagging.DRY_RUN else ''}.")
+
 # ============================================================================= ABOUT
 with tab_about:
     st.markdown(
@@ -402,6 +512,14 @@ with tab_about:
    same Approve button perform the real per-product write.
 5. **Verify** — the tag lands on the resource immediately; billing attribution follows on
    future usage.
+
+**Bulk tagging (for 1000s of workloads):** the *Bulk tag* tab lets you define a handful of
+**rules** — e.g. `owner equals data-eng@… → team=data-engineering`, or
+`name matches fraud-* → team=risk`. Each rule attributes every matching workload at once;
+earlier rules win on conflict. You preview the exact match count, cost coverage, per-rule
+breakdown, a 50-row sample, and any conflicts **before** applying. In dry-run nothing is
+mutated; live runs execute as a batched, per-product Databricks job that scales to thousands
+and reports per-workload success/failure.
 
 **Why per-product matters:** Jobs, SQL warehouses, pipelines, serving & vector-search
 endpoints each have their own `custom_tags` API. Serverless products (serverless SQL, Apps)

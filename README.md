@@ -20,6 +20,7 @@ ranks them by cost, and lets you apply your own tag keys in place — with a saf
 | **Per workspace** | `system.billing.usage` is **account-wide**, so the app sees every workspace with no extra login. Filter to one/all, and see which workspaces carry the most unattributable spend. |
 | **Suggest owner** | Pulls `identity_metadata` so even untagged workloads come with a likely owner — a one-click starting value. |
 | **Tag in place** | Pick your own keys, **① Preview** the exact per-resource API call, **② Approve & apply**. Approvals collect in a session queue with a running "spend now attributable" total. |
+| **Bulk tag (rules)** | For 1000s of workloads: define a few **rules** (`owner equals X → team=Y`, `name matches fraud-* → team=risk`). Each rule attributes every match at once; earlier rules win on conflict. Preview match count, cost coverage, per-rule breakdown, a sample, and conflicts before applying. |
 | **Verify** | Tag lands on the resource immediately; billing attribution follows on future usage (system tables lag ~hours). |
 
 **Dry-run by default** — approving *records* the decision without mutating. Live

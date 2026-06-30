@@ -134,6 +134,30 @@ LIMIT {limit}
 """
 
 
+def untagged_workloads(days, tag_keys, workspaces=None, limit=10000):
+    """ALL untagged workloads with the attributes bulk rules match on.
+
+    Returns one row per workload with owner / workspace / product / name / cost,
+    so rule matching + conflict detection can run client-side over the full set.
+    """
+    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS)
+    return f"""
+SELECT product,
+       workload_id,
+       MAX(workspace_id)                AS workspace_id,
+       MAX(workload_name)               AS workload_name,
+       MAX(owner)                       AS owner,
+       MAX(is_serverless)               AS is_serverless,
+       ROUND(SUM(list_cost), 0)         AS untagged_cost
+FROM {SUMMARY_TABLE}
+WHERE {_where(days, workspaces)}
+GROUP BY product, workload_id
+HAVING {untag_expr} AND SUM(list_cost) > 0
+ORDER BY untagged_cost DESC
+LIMIT {limit}
+"""
+
+
 def workspace_options(days):
     """All workspaces in the table (for the sidebar picker), ranked by spend, with names."""
     return f"""
