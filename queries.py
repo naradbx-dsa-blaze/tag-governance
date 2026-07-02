@@ -24,6 +24,23 @@ SUMMARY_TABLE = os.environ.get(
     "users.narasimha_kamathardi.tag_governance_workload_daily",
 )
 
+# Write-queue and audit tables — configurable for cross-account deploys, same as
+# SUMMARY_TABLE. The app INSERTs intent into QUEUE_TABLE; the writer job drains it
+# and records changes to AUDIT_TABLE.
+QUEUE_TABLE = os.environ.get(
+    "TAG_GOVERNANCE_QUEUE_TABLE",
+    "users.narasimha_kamathardi.tag_governance_write_queue",
+)
+AUDIT_TABLE = os.environ.get(
+    "TAG_GOVERNANCE_AUDIT_TABLE",
+    "users.narasimha_kamathardi.tag_governance_audit",
+)
+# Advisory ai_query suggestions (agent hints). Read-only join for the UI.
+SUGGESTIONS_TABLE = os.environ.get(
+    "TAG_GOVERNANCE_SUGGESTIONS_TABLE",
+    "users.narasimha_kamathardi.tag_governance_suggestions",
+)
+
 # tag_keys aggregated up from the daily rows of one workload
 _AGG_KEYS = "array_distinct(flatten(collect_list(tag_keys)))"
 
@@ -314,3 +331,195 @@ LIMIT 50
 def freshness():
     """Max usage_date in the summary table, to show 'data as of' in the UI."""
     return f"SELECT MAX(usage_date) AS as_of, COUNT(*) AS rows FROM {SUMMARY_TABLE}"
+
+
+# ============================================================================
+# Write-queue enqueue + status (feeds the writer job)
+# ============================================================================
+# The app records write INTENT into QUEUE_TABLE. Bulk enqueue is a single
+# INSERT … SELECT evaluated in the warehouse — matched workloads are expanded to
+# one queue row per (workload, tag_key) directly in SQL, so a 50k-workload rule
+# never round-trips through the browser.
+
+def _sql_str(v):
+    """Quote-escape a python string for inline SQL."""
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def enqueue_bulk_sql(batch_id, requested_by, days, tag_keys, rules, workspaces=None):
+    """INSERT one queue row per (matched workload, tag_key) for a rule set.
+
+    Reuses the exact untagged + first-match-wins logic of bulk_rule_impact: a
+    workload is tagged by the FIRST rule (by priority) whose predicate it matches,
+    and gets that rule's tags. Earlier rules win, matching those UI numbers.
+    Returns None if there are no valid rules.
+    """
+    valid = [r for r in rules if r.get("value") and r.get("tags")]
+    if not valid:
+        return None
+
+    ladder = "\n".join(
+        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+
+    # Map each rule index -> its tags, expanded into (rule_idx, key, value) rows
+    # so a LATERAL join attaches the winning rule's tags to each workload.
+    tag_tuples = []
+    for i, r in enumerate(valid):
+        for k, v in r["tags"].items():
+            tag_tuples.append(f"({i}, {_sql_str(k)}, {_sql_str(v)})")
+    tags_values = ",\n    ".join(tag_tuples)
+
+    return f"""
+INSERT INTO {QUEUE_TABLE}
+  (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
+   workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
+WITH wl AS (
+  SELECT workload_id, product,
+         MAX(workspace_id)  AS workspace_id,
+         MAX(workload_name) AS workload_name,
+         MAX(owner)         AS owner,
+         MAX(is_serverless) AS is_serverless,
+         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         SUM(list_cost)     AS cost
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+),
+matched AS (
+  SELECT *, CASE
+{ladder}
+           ELSE -1 END AS first_rule
+  FROM wl
+  WHERE is_untagged AND cost > 0
+),
+ruletags(rule_idx, tag_key, tag_value) AS (
+  VALUES
+    {tags_values}
+)
+SELECT
+  {_sql_str(batch_id)}      AS batch_id,
+  current_timestamp()       AS enqueued_at,
+  {_sql_str(requested_by)}  AS requested_by,
+  m.workspace_id, m.product, m.workload_id, m.workload_name, m.is_serverless,
+  rt.tag_key, rt.tag_value,
+  m.cost                    AS list_cost,
+  'PENDING'                 AS status,
+  0                         AS attempts
+FROM matched m
+JOIN ruletags rt ON rt.rule_idx = m.first_rule
+WHERE m.first_rule >= 0
+"""
+
+
+def enqueue_single_sql(batch_id, requested_by, workspace_id, product, workload_id,
+                       workload_name, is_serverless, tags):
+    """INSERT queue rows for one workload with an explicit tag dict."""
+    rows = []
+    for k, v in tags.items():
+        rows.append(
+            f"({_sql_str(batch_id)}, current_timestamp(), {_sql_str(requested_by)}, "
+            f"{_sql_str(workspace_id)}, {_sql_str(product)}, {_sql_str(workload_id)}, "
+            f"{_sql_str(workload_name or workload_id)}, {1 if is_serverless else 0}, "
+            f"{_sql_str(k)}, {_sql_str(v)}, NULL, 'PENDING', 0)")
+    values = ",\n  ".join(rows)
+    return f"""
+INSERT INTO {QUEUE_TABLE}
+  (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
+   workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
+VALUES
+  {values}
+"""
+
+
+def batch_status(batch_id):
+    """Per-status counts + cost for one batch — headline for the Batches tab."""
+    return f"""
+SELECT status,
+       COUNT(*)                          AS rows,
+       COUNT(DISTINCT workload_id)       AS workloads,
+       ROUND(SUM(list_cost), 0)          AS cost
+FROM {QUEUE_TABLE}
+WHERE batch_id = {_sql_str(batch_id)}
+GROUP BY status
+ORDER BY status
+"""
+
+
+def batch_rows(batch_id, limit=500):
+    """Per-workload rows for a batch, with status + any error (for the detail table)."""
+    return f"""
+SELECT product, workload_id, workload_name, tag_key, tag_value,
+       status, last_error, ROUND(list_cost, 0) AS cost
+FROM {QUEUE_TABLE}
+WHERE batch_id = {_sql_str(batch_id)}
+ORDER BY list_cost DESC NULLS LAST
+LIMIT {limit}
+"""
+
+
+def recent_batches(limit=25):
+    """Most recent batches with rollup status, for the Batches & Rollback tab."""
+    return f"""
+SELECT batch_id,
+       MAX(enqueued_at)                                        AS enqueued_at,
+       MAX(requested_by)                                       AS requested_by,
+       COUNT(*)                                                AS rows,
+       COUNT(DISTINCT workload_id)                             AS workloads,
+       ROUND(SUM(list_cost), 0)                                AS cost,
+       SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END)       AS pending,
+       SUM(CASE WHEN status='SUCCEEDED' THEN 1 ELSE 0 END)     AS succeeded,
+       SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END)        AS failed,
+       SUM(CASE WHEN status='UNSUPPORTED' THEN 1 ELSE 0 END)   AS unsupported,
+       SUM(CASE WHEN status='SKIPPED_DRYRUN' THEN 1 ELSE 0 END) AS dry_run
+FROM {QUEUE_TABLE}
+GROUP BY batch_id
+ORDER BY enqueued_at DESC
+LIMIT {limit}
+"""
+
+
+def audit_for_batch(batch_id, limit=500):
+    """Audit history for a batch — the old→new record, for verify + rollback view."""
+    return f"""
+SELECT executed_at, action, product, workload_id, tag_key,
+       old_value, new_value, status, error
+FROM {AUDIT_TABLE}
+WHERE batch_id = {_sql_str(batch_id)}
+ORDER BY executed_at DESC
+LIMIT {limit}
+"""
+
+
+# ============================================================================
+# Advisory agent suggestions (ai_query hints) — read-only join for the UI
+# ============================================================================
+
+def suggestions_join(days, tag_keys, workspaces=None, limit=200):
+    """Leaderboard of untagged workloads WITH the advisory ai_query suggestion.
+
+    LEFT JOINs the suggestions table so workloads without a suggestion still show.
+    The suggestion is a HINT only — the human decides whether to act on it.
+    """
+    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS)
+    return f"""
+WITH wl AS (
+  SELECT product, workload_id,
+         MAX(workspace_id)               AS workspace_id,
+         MAX(workload_name)              AS workload_name,
+         MAX(owner)                      AS owner,
+         MAX(is_serverless)              AS is_serverless,
+         ROUND(SUM(list_cost), 0)        AS untagged_cost
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+  HAVING {untag_expr} AND SUM(list_cost) > 0
+)
+SELECT wl.product, wl.workload_id, wl.workspace_id, wl.workload_name, wl.owner,
+       wl.is_serverless, wl.untagged_cost,
+       s.suggested_cost_center, s.confidence, s.rationale
+FROM wl
+LEFT JOIN {SUGGESTIONS_TABLE} s
+  ON s.workload_id = wl.workload_id AND s.product = wl.product
+ORDER BY wl.untagged_cost DESC
+LIMIT {limit}
+"""

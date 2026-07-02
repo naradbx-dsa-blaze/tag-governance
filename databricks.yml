@@ -16,6 +16,18 @@ variables:
   summary_table:
     description: "Fully-qualified UC table for the pre-aggregated summary"
     default: users.narasimha_kamathardi.tag_governance_workload_daily
+  queue_table:
+    description: "Fully-qualified UC table for the write-intent queue"
+    default: users.narasimha_kamathardi.tag_governance_write_queue
+  audit_table:
+    description: "Fully-qualified UC table for the change audit log"
+    default: users.narasimha_kamathardi.tag_governance_audit
+  suggestions_table:
+    description: "Fully-qualified UC table for advisory ai_query suggestions"
+    default: users.narasimha_kamathardi.tag_governance_suggestions
+  annotate_model:
+    description: "Model/endpoint name used by the advisory ai_query annotation"
+    default: databricks-meta-llama-3-3-70b-instruct
 
 resources:
   jobs:
@@ -36,6 +48,84 @@ resources:
               path: ./materialize.sql
             parameters:
               summary_table: ${var.summary_table}
+        # Advisory ai_query suggestions rebuild after the summary refreshes.
+        - task_key: annotate
+          depends_on:
+            - task_key: materialize
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./annotate.sql
+            parameters:
+              summary_table: ${var.summary_table}
+              suggestions_table: ${var.suggestions_table}
+              annotate_model: ${var.annotate_model}
+
+    # Applies queued tag changes. dry_run=true (default) writes nothing and logs
+    # intended old→new. Set dry_run=false to perform live per-product writes.
+    # M1: workspace_id restricts to the home workspace.
+    tag-governance-writer:
+      name: tag-governance-writer
+      description: "Drain the write queue and apply tags (dry-run by default), cost-descending with audit"
+      parameters:
+        - name: queue_table
+          default: ${var.queue_table}
+        - name: audit_table
+          default: ${var.audit_table}
+        - name: dry_run
+          default: "true"
+        - name: workspace_id
+          default: ""
+        - name: batch_id
+          default: ""
+        - name: max_workers
+          default: "4"
+      tasks:
+        - task_key: drain_queue
+          spark_python_task:
+            python_file: ./writer_job.py
+            # spark_python_task reads params from argv, so forward each job
+            # parameter as key=value (writer_job._param parses these).
+            parameters:
+              - queue_table={{job.parameters.queue_table}}
+              - audit_table={{job.parameters.audit_table}}
+              - dry_run={{job.parameters.dry_run}}
+              - workspace_id={{job.parameters.workspace_id}}
+              - batch_id={{job.parameters.batch_id}}
+              - max_workers={{job.parameters.max_workers}}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+
+    # Rolls a batch back — restores every tag to its pre-batch value from the audit log.
+    tag-governance-rollback:
+      name: tag-governance-rollback
+      description: "Undo a batch by replaying the audit log in reverse"
+      parameters:
+        - name: audit_table
+          default: ${var.audit_table}
+        - name: batch_id
+          default: ""
+        - name: dry_run
+          default: "true"
+        - name: max_workers
+          default: "4"
+      tasks:
+        - task_key: rollback_batch
+          spark_python_task:
+            python_file: ./rollback_job.py
+            parameters:
+              - audit_table={{job.parameters.audit_table}}
+              - batch_id={{job.parameters.batch_id}}
+              - dry_run={{job.parameters.dry_run}}
+              - max_workers={{job.parameters.max_workers}}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
 
   apps:
     tag-governance:
@@ -57,12 +147,16 @@ resources:
             value_from: sql-warehouse
           - name: TAG_GOVERNANCE_SUMMARY_TABLE
             value: ${var.summary_table}
+          - name: TAG_GOVERNANCE_QUEUE_TABLE
+            value: ${var.queue_table}
+          - name: TAG_GOVERNANCE_AUDIT_TABLE
+            value: ${var.audit_table}
+          - name: TAG_GOVERNANCE_SUGGESTIONS_TABLE
+            value: ${var.suggestions_table}
           - name: STREAMLIT_SERVER_ENABLE_CORS
             value: "false"
           - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
             value: "false"
-          - name: TAG_GOVERNANCE_DRY_RUN
-            value: "true"
 
 targets:
   dev:

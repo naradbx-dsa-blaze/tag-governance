@@ -216,18 +216,13 @@ def evaluate_rules(rules: list, rows: list) -> dict:
 
 
 def bulk_apply(assignments: dict, rows_by_id: dict) -> dict:
-    """Apply a set of {workload_id: tags} assignments.
+    """Apply a set of {workload_id: tags} assignments (pure-Python, no SQL).
 
-    In DRY_RUN this records the batch and reports per-workload results WITHOUT
-    mutating. Live execution is intended to run as a Databricks JOB (batched,
-    concurrent, per-product) — not inline in the app — so it scales to thousands
-    and survives partial failure. Guarded until live writes are implemented.
+    Kept for the client-side rule path / tests. In DRY_RUN it records the batch
+    and reports per-workload results without mutating. Live bulk writes go through
+    enqueue_bulk (SQL INSERT … SELECT) + the writer job, NOT this function — so it
+    stays a dry-run helper rather than raising.
     """
-    if not DRY_RUN:
-        raise NotImplementedError(
-            "Live bulk writes run as a Databricks job; not enabled. Implement the "
-            "per-product batched writer before setting TAG_GOVERNANCE_DRY_RUN=false."
-        )
     results = []
     for wid, tags in assignments.items():
         row = rows_by_id.get(wid, {})
@@ -247,42 +242,71 @@ def bulk_apply(assignments: dict, rows_by_id: dict) -> dict:
     }
 
 
-def bulk_apply_summary(count: int, cost: float) -> dict:
-    """Record a bulk apply when matching was done in SQL (no row set in hand).
+# ---------------------------------------------------------------------------
+# Enqueue: record write INTENT into the queue. The app never mutates a resource;
+# the writer job drains the queue. A fresh batch_id groups everything enqueued in
+# one action so it can be tracked and rolled back as a unit. DRY_RUN now lives on
+# the writer JOB (which decides whether to actually write), so enqueuing is always
+# safe — it only inserts rows.
+# ---------------------------------------------------------------------------
 
-    In DRY_RUN, just acknowledges the batch by its aggregate count/cost. Live
-    execution hands the rule set to a Databricks job that does the per-product
-    batched writes — the app does not write thousands of resources inline.
+def _new_batch_id() -> str:
+    import uuid
+    return f"batch-{uuid.uuid4().hex[:12]}"
+
+
+def _requested_by() -> str:
+    import os
+    return os.environ.get("TAG_GOVERNANCE_USER") or "app"
+
+
+def enqueue_single(plan: "TagPlan", workspace_id: str, is_serverless: bool = False) -> dict:
+    """Enqueue one workload's tags. Returns {batch_id, count} or UNSUPPORTED."""
+    import db
+    import queries
+    if not plan.supported:
+        return {"status": "UNSUPPORTED",
+                "message": f"No tag-write path for product '{plan.product}' yet."}
+    batch_id = _new_batch_id()
+    sql = queries.enqueue_single_sql(
+        batch_id=batch_id, requested_by=_requested_by(), workspace_id=workspace_id,
+        product=plan.product, workload_id=plan.workload_id,
+        workload_name=plan.workload_name, is_serverless=is_serverless, tags=plan.tags,
+    )
+    db.run_exec(sql)
+    return {"status": "ENQUEUED", "batch_id": batch_id, "count": len(plan.tags),
+            "workload": plan.workload_name or plan.workload_id, "tags": plan.tags}
+
+
+def enqueue_bulk(days: int, tag_keys: list, rules: list, workspaces=None) -> dict:
+    """Enqueue all workloads matched by a rule set (SQL INSERT … SELECT).
+
+    Expansion to one row per (workload, tag_key) happens in the warehouse, so a
+    50k-workload rule never round-trips through the app. Returns the batch_id and
+    how many queue rows were inserted.
     """
-    if not DRY_RUN:
-        raise NotImplementedError(
-            "Live bulk writes run as a Databricks job; not enabled. Implement the "
-            "per-product batched writer before setting TAG_GOVERNANCE_DRY_RUN=false."
-        )
-    return {"status": "BULK_DRY_RUN", "count": count, "total_cost": cost}
+    import db
+    import queries
+    batch_id = _new_batch_id()
+    sql = queries.enqueue_bulk_sql(
+        batch_id=batch_id, requested_by=_requested_by(), days=days,
+        tag_keys=tag_keys, rules=rules, workspaces=workspaces,
+    )
+    if sql is None:
+        return {"status": "NO_RULES", "message": "No valid rules to enqueue."}
+    inserted = db.run_exec(sql)
+    return {"status": "ENQUEUED", "batch_id": batch_id, "rows": inserted}
 
 
-def approve(plan: TagPlan) -> dict:
-    """Approve & apply the plan.
+def approve(plan: TagPlan, workspace_id: str = "", is_serverless: bool = False) -> dict:
+    """Approve the plan by enqueuing it for the writer job.
 
-    In DRY_RUN this records the approval and reports success WITHOUT touching any
-    resource (so the demo shows the full approve → tagged flow safely). With
-    DRY_RUN off, this is where the per-product SDK write goes — guarded for now so
-    a flipped flag fails loud rather than silently no-op'ing.
+    This no longer writes (or pretends to write) inline — it records intent into
+    the queue and returns a batch_id. Whether the writer actually mutates the
+    resource depends on the writer job's dry_run parameter, keeping the safety
+    switch next to the code that does the writing.
     """
     if not plan.supported:
         return {"status": "UNSUPPORTED",
                 "message": f"No tag-write path for product '{plan.product}' yet."}
-    if DRY_RUN:
-        return {
-            "status": "APPROVED_DRY_RUN",
-            "message": "Approved (dry-run) — recorded, no resource modified.",
-            "resource": plan.resource_type,
-            "workload": plan.workload_name or plan.workload_id,
-            "would_call": plan.api_hint,
-            "tags": plan.tags,
-        }
-    raise NotImplementedError(
-        "Live tag writes are not enabled. Implement per-product SDK calls before "
-        "setting TAG_GOVERNANCE_DRY_RUN=false."
-    )
+    return enqueue_single(plan, workspace_id=workspace_id, is_serverless=is_serverless)

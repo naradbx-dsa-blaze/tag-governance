@@ -35,6 +35,16 @@ system.billing.usage  ──┐
 (account-wide, all WS)   │   materialize.sql (daily job)
 system.billing.list_prices ─► tag_governance_workload_daily  ──► Streamlit app
 system.access.workspaces_latest                (pre-aggregated)      (sub-second reads)
+                                     annotate.sql (ai_query) ──► tag_governance_suggestions
+                                                                   (advisory hints)
+
+WRITE PATH (app never mutates a resource):
+  app  ──enqueue──►  tag_governance_write_queue  ──drain──►  writer_job.py
+  (INSERT intent)         (PENDING rows)          (cost-desc,   ├─ GET→MERGE→PUT tag
+                                                   per-WS,      └─ audit old→new
+                                                   429 backoff)     │
+  Batches & Rollback tab ◄── status + audit ◄── tag_governance_audit ◄┘
+  rollback_job.py ──replay audit in reverse──► restore pre-batch values
 ```
 
 - **`materialize.sql`** collapses millions of raw usage rows into one row per
@@ -61,13 +71,18 @@ system.access.workspaces_latest                (pre-aggregated)      (sub-second
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Streamlit UI — Scan / Tag & Verify / How-it-works tabs |
-| `db.py` | Cached SQL connection + `run_query` |
-| `queries.py` | SQL builders; reads `TAG_GOVERNANCE_SUMMARY_TABLE` |
+| `app.py` | Streamlit UI — Scan / Tag & Verify / Bulk / Batches & Rollback / How-it-works |
+| `db.py` | Cached SQL connection + `run_query` (read) + `run_exec` (enqueue write) |
+| `queries.py` | SQL builders — reads/enqueue/status/suggestions; reads `TAG_GOVERNANCE_*_TABLE` |
 | `materialize.sql` | Builds the summary table — `CREATE TABLE IDENTIFIER(:summary_table)` |
-| `tagging.py` | Per-product tag-write API map + preview/approve (dry-run guarded) |
+| `schema.sql` | Creates the write-queue + audit tables (`IF NOT EXISTS`) |
+| `annotate.sql` | Advisory `ai_query` classifier → `tag_governance_suggestions` (hints only) |
+| `tagging.py` | Per-product API map + `plan_for`/`preview` + `enqueue_single`/`enqueue_bulk` |
+| `writer.py` | Per-product live tag writes (GET→MERGE→PUT, idempotent, best-effort) |
+| `writer_job.py` | Drains the queue cost-descending, per-workspace + 429 backoff, writes audit |
+| `rollback_job.py` | Undoes a batch by replaying the audit in reverse |
 | `app.yaml` | Apps runtime config |
-| `databricks.yml` | DAB bundle (app + refresh job) with `warehouse_id` / `summary_table` variables |
+| `databricks.yml` | DAB bundle (app + refresh/writer/rollback jobs) with `*_table` variables |
 | `requirements.txt` | streamlit, databricks-sql-connector, databricks-sdk, pandas |
 
 ---
@@ -151,21 +166,65 @@ streamlit run app.py
 
 ---
 
-## Dry-run → live tag writes
+## Applying tags: queue → writer job → audit → rollback
 
-The app ships in **dry-run** (`TAG_GOVERNANCE_DRY_RUN=true`). Approving records
-the decision and marks the workload Tagged **without mutating any resource**.
+The app **never mutates a resource.** Queuing (single or bulk) inserts intent rows
+into `tag_governance_write_queue`. A separate **writer job** applies them; a
+**rollback job** undoes a batch. This keeps writes safe, resumable, rate-limited,
+and reversible — and it scales to the full fleet.
 
-To enable real writes:
-1. Implement the per-product SDK calls in `tagging.approve()` (the API per product
-   is already mapped in `PRODUCT_PLANS`: jobs, pipelines, warehouses, serving &
-   vector-search endpoints, clusters, Lakebase).
-2. Set `TAG_GOVERNANCE_DRY_RUN=false`.
+### One-time: create the queue + audit tables
+```bash
+databricks bundle deploy               # ships app + jobs + files
+# create the write-queue and audit tables (idempotent)
+databricks sql query --warehouse <id> --file schema.sql \
+  --param queue_table=<cat.sch.tag_governance_write_queue> \
+  --param audit_table=<cat.sch.tag_governance_audit>
+```
 
-> **Cross-workspace note:** reading billing is account-wide, but *writing* a tag to
-> a job in workspace X requires an identity with write permission **in workspace X**.
-> For multi-workspace writes, use per-workspace service principals / OAuth — do not
-> store PATs in the app.
+### Apply a batch (dry-run first — always)
+```bash
+# 1. Dry-run: writes NOTHING, logs the intended old→new for inspection
+databricks bundle run tag-governance-writer -- \
+  --python-params dry_run=true batch_id=<BATCH_ID>
+
+# 2. Live (M1 = home workspace only): performs the real per-product writes
+databricks bundle run tag-governance-writer -- \
+  --python-params dry_run=false batch_id=<BATCH_ID> workspace_id=<HOME_WS_ID>
+```
+The writer drains **cost-descending** (largest spend first), runs **per-workspace in
+parallel** with exponential backoff on HTTP 429, is **idempotent** (a tag already at
+the target value is a no-op), and records **old→new** for every change to the audit
+table. Re-running after a crash simply drains the remaining `PENDING` rows.
+
+### Roll a batch back
+```bash
+databricks bundle run tag-governance-rollback -- \
+  --python-params dry_run=false batch_id=<BATCH_ID>
+```
+Restores every tag to its pre-batch value from the audit log (removes the key if it
+didn't exist before), writing `ROLLBACK` audit rows.
+
+### What is and isn't taggable (be honest with the customer)
+Roughly **59% of untagged cost is directly taggable** (Jobs, clusters, non-serverless
+warehouses, Model Serving, and — on a current SDK — Lakebase & Vector Search). The
+other **~41%** (serverless SQL, Apps) attributes via **budget/tag policy**, not a
+per-resource `custom_tags` write — the writer reports these as `UNSUPPORTED` with a
+reason rather than pretending to tag them. Pair the backlog cleanup with **tag/budget
+policies** for that portion.
+
+> **SDK note:** `writer.py` feature-detects APIs (`hasattr`). On older SDKs the
+> `database` (Lakebase) and Vector Search tag calls are absent and return
+> `UNSUPPORTED`; on the current Apps/job runtime they work. Keep the job environment
+> on a recent `databricks-sdk` to tag those products.
+
+### Cross-workspace writes (M2)
+Reading billing is account-wide, but *writing* a tag to a resource in workspace X
+needs an identity valid **in workspace X**. M1 restricts the writer to the home
+workspace (`workspace_id=<HOME_WS_ID>`). For M2, provision an **account-level service
+principal** into each workspace and build a per-workspace `WorkspaceClient` in
+`writer_job._client_for_workspace` (the single seam that changes). Do **not** store
+PATs in the app.
 
 ---
 

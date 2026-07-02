@@ -56,3 +56,18 @@ def run_query(sql_text: str) -> pd.DataFrame:
         if len(df) and isinstance(df[c].iloc[0], Decimal):
             df[c] = df[c].astype(float)
     return df
+
+
+def run_exec(sql_text: str) -> int:
+    """Run a write statement (INSERT/DELETE/MERGE). NOT cached — it mutates.
+
+    Returns the affected row count when the driver reports one, else -1. Unlike
+    run_query it never touches cur.description/fetchall, which are absent for DML.
+    """
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(sql_text)
+        try:
+            return cur.rowcount if cur.rowcount is not None else -1
+        except Exception:
+            return -1
