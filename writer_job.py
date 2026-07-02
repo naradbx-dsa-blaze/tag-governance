@@ -84,29 +84,34 @@ def _client_for_workspace(workspace_id: str, home_client: WorkspaceClient) -> Wo
     return home_client  # M1: home workspace only
 
 
-def _apply_row(client, row) -> writer.WriteResult:
-    """Attempt one row with backoff on rate limiting."""
-    delay = _BASE_DELAY
-    result = writer.attempt_write(
-        client, row["product"], row["workload_id"], row["workload_name"],
-        row["tag_key"], row["tag_value"], is_serverless=bool(row.get("is_serverless")),
-    )
-    retries = 0
+def _apply_row(client, row, dry_run: bool) -> writer.WriteResult:
+    """Attempt one row with backoff on rate limiting.
+
+    dry_run is threaded all the way into the per-product writer, which reads the
+    resource and computes old→new but performs NO mutation when dry_run is True.
+    """
+    def once():
+        return writer.attempt_write(
+            client, row["product"], row["workload_id"], row["workload_name"],
+            row["tag_key"], row["tag_value"],
+            is_serverless=bool(row.get("is_serverless")), dry_run=dry_run,
+        )
+    result = once()
+    retries, delay = 0, _BASE_DELAY
     while _is_rate_limited(result) and retries < _MAX_RETRIES:
         time.sleep(delay)
         delay *= 2
         retries += 1
-        result = writer.attempt_write(
-            client, row["product"], row["workload_id"], row["workload_name"],
-            row["tag_key"], row["tag_value"], is_serverless=bool(row.get("is_serverless")),
-        )
+        result = once()
     return result
 
 
-def _status_for(result: writer.WriteResult, dry_run: bool) -> str:
-    if dry_run:
-        # In dry-run we still record what WOULD happen, but never mark SUCCEEDED.
-        return "SKIPPED_DRYRUN" if result.status == "SUCCEEDED" else result.status
+def _status_for(result: writer.WriteResult) -> str:
+    """Map a WriteResult to a queue status. dry_run is carried on the result
+    itself (the writer set it and did NOT mutate), so a would-be success becomes
+    SKIPPED_DRYRUN while FAILED/UNSUPPORTED pass through unchanged."""
+    if result.status == "SUCCEEDED" and result.dry_run:
+        return "SKIPPED_DRYRUN"
     return result.status
 
 
@@ -128,11 +133,26 @@ def run():
     except Exception:
         pass
 
-    where = ["status = 'PENDING'"]
-    if only_workspace:
-        where.append(f"workspace_id = '{only_workspace}'")
+    # M1 SAFETY: the writer only has a home-workspace client (_client_for_workspace
+    # always returns it), so it must never attempt foreign-workspace rows — a
+    # colliding resource id would be mis-tagged in the home workspace. If no
+    # workspace_id was passed, default to THIS workspace rather than draining all.
+    if not only_workspace:
+        try:
+            only_workspace = str(home_client.get_workspace_id())
+            print(f"workspace_id not set — defaulting to home workspace {only_workspace} (M1).")
+        except Exception:
+            raise SystemExit(
+                "workspace_id not provided and home workspace id could not be resolved; "
+                "refusing to drain all workspaces with a home-only client (M1)."
+            )
+
+    def _q(v: str) -> str:  # escape single quotes for inline SQL
+        return v.replace("'", "''")
+
+    where = ["status = 'PENDING'", f"workspace_id = '{_q(only_workspace)}'"]
     if only_batch:
-        where.append(f"batch_id = '{only_batch}'")
+        where.append(f"batch_id = '{_q(only_batch)}'")
     where_sql = " AND ".join(where)
 
     # Cost-descending drain: largest spend attributed first.
@@ -160,29 +180,30 @@ def run():
         client = _client_for_workspace(workspace_id, home_client)
         local_audit, local_updates = [], []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_apply_row, client, row): row for row in rows}
+            futures = {pool.submit(_apply_row, client, row, dry_run): row for row in rows}
             for fut in as_completed(futures):
                 row = futures[fut]
                 result = fut.result()
-                status = _status_for(result, dry_run)
+                status = _status_for(result)
                 local_updates.append({
                     "batch_id": row["batch_id"], "workload_id": row["workload_id"],
-                    "tag_key": row["tag_key"], "status": status,
-                    "last_error": result.error,
+                    "product": row["product"], "tag_key": row["tag_key"],
+                    "status": status, "last_error": result.error,
                 })
-                # Record audit for anything that changed state or would have.
-                if result.status in ("SUCCEEDED", "FAILED"):
+                # Audit only ACTUAL changes: a live SET that ran, or a real FAILURE.
+                # Dry-run "would-be" writes (result.dry_run) are not persisted —
+                # the audit table is a truthful record of what happened, not intent.
+                real_change = (result.status == "SUCCEEDED" and not result.dry_run and not result.noop)
+                if real_change or result.status == "FAILED":
                     local_audit.append({
                         "audit_id": str(uuid.uuid4()), "batch_id": row["batch_id"],
                         "executed_by": executed_by, "workspace_id": workspace_id,
                         "product": row["product"], "workload_id": row["workload_id"],
                         "tag_key": row["tag_key"], "old_value": result.old_value,
-                        "new_value": (result.new_value if not dry_run else None),
+                        "new_value": (result.new_value if real_change else None),
                         "action": "SET",
-                        "status": "SUCCEEDED" if result.status == "SUCCEEDED" else "FAILED",
+                        "status": "SUCCEEDED" if real_change else "FAILED",
                         "error": result.error,
-                        "intended_new_value": result.new_value,  # for dry-run visibility
-                        "dry_run": dry_run,
                     })
         return local_audit, local_updates
 
@@ -201,30 +222,31 @@ def run():
 
 
 def _persist(queue_table, audit_table, queue_updates, audit_rows, dry_run):
-    """Write status back to the queue and append audit rows, via temp views + MERGE."""
-    import json
+    """Write status back to the queue and append audit rows, via temp views + MERGE.
+
+    audit_rows already contains ONLY real changes (dry-run produces none), so
+    there's no dry-run guard here. saveAsTable append resolves by column name, so
+    the dict order is irrelevant; each row carries its own executed_by.
+    """
     from pyspark.sql import functions as F
 
-    if audit_rows and not dry_run:
-        # Only persist real changes to the durable audit (dry-run audit is
-        # informational and printed, not stored, to keep the log truthful).
-        adf = spark.createDataFrame([
-            {k: v for k, v in a.items() if k in (
-                "audit_id", "batch_id", "workspace_id", "product", "workload_id",
-                "tag_key", "old_value", "new_value", "action", "status", "error")}
-            for a in audit_rows
-        ]).withColumn("executed_at", F.current_timestamp()) \
-          .withColumn("executed_by", F.lit(audit_rows[0].get("executed_by")))
+    if audit_rows:
+        adf = spark.createDataFrame(audit_rows).withColumn(
+            "executed_at", F.current_timestamp())
         adf.write.mode("append").saveAsTable(audit_table)
 
     if queue_updates:
         udf = spark.createDataFrame(queue_updates)
         udf.createOrReplaceTempView("_tg_updates")
+        # Match on the full natural key including product: workload_id is a
+        # coalesce over id namespaces, so the same id string can appear under two
+        # products; without product the MERGE could match multiple source rows.
         spark.sql(f"""
             MERGE INTO {queue_table} t
             USING _tg_updates s
             ON  t.batch_id = s.batch_id
             AND t.workload_id = s.workload_id
+            AND t.product = s.product
             AND t.tag_key = s.tag_key
             WHEN MATCHED THEN UPDATE SET
               t.status = s.status,

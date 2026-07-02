@@ -176,7 +176,16 @@ LIMIT {limit}
 
 
 def _rule_sql_predicate(rule):
-    """SQL boolean for one rule's match condition over the workload aggregate."""
+    """SQL boolean for one rule's match condition over the workload aggregate.
+
+    Drives the ENQUEUE path (enqueue_bulk_sql), so over-matching here means the
+    writer job tags MORE resources than intended — escaping must be exact:
+      - single quotes doubled (SQL literal safety)
+      - LIKE metacharacters %/_/\\ escaped, with an explicit ESCAPE '\\' clause,
+        so a user value like "data_eng" or "50%" matches literally, not as a glob.
+    For the `matches` (glob) op we escape literal %/_/\\ FIRST, then translate the
+    glob wildcards *→% and ?→_ so they stay active.
+    """
     col = {"owner": "owner", "workspace": "workspace_id",
            "product": "product", "name": "workload_name"}[rule["field"]]
     val = rule["value"].replace("'", "''")
@@ -184,11 +193,21 @@ def _rule_sql_predicate(rule):
     if rule["op"] == "equals":
         return f"{c} = lower('{val}')"
     if rule["op"] == "contains":
-        return f"{c} LIKE lower('%{val}%')"
+        lit = _escape_like(val)
+        return f"{c} LIKE lower('%{lit}%') ESCAPE '\\\\'"
     if rule["op"] == "matches":  # glob -> LIKE
-        like = val.replace("%", "\\%").replace("_", "\\_").replace("*", "%").replace("?", "_")
-        return f"{c} LIKE lower('{like}')"
+        like = _escape_like(val).replace("*", "%").replace("?", "_")
+        return f"{c} LIKE lower('{like}') ESCAPE '\\\\'"
     return "false"
+
+
+def _escape_like(val):
+    """Escape LIKE metacharacters so they match literally (with ESCAPE '\\').
+
+    Backslash first (so we don't double-escape the escapes we add), then %/_.
+    `val` has already had single quotes doubled by the caller.
+    """
+    return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def bulk_rule_impact(days, tag_keys, rules, workspaces=None):
@@ -412,15 +431,20 @@ WHERE m.first_rule >= 0
 
 
 def enqueue_single_sql(batch_id, requested_by, workspace_id, product, workload_id,
-                       workload_name, is_serverless, tags):
-    """INSERT queue rows for one workload with an explicit tag dict."""
+                       workload_name, is_serverless, tags, list_cost=None):
+    """INSERT queue rows for one workload with an explicit tag dict.
+
+    list_cost is carried so single-enqueued rows drain cost-descending like bulk
+    rows and show their real cost in the Batches tab (NULL → drained last, $0).
+    """
+    cost_sql = "NULL" if list_cost is None else f"CAST({float(list_cost)} AS DECIMAL(38,6))"
     rows = []
     for k, v in tags.items():
         rows.append(
             f"({_sql_str(batch_id)}, current_timestamp(), {_sql_str(requested_by)}, "
             f"{_sql_str(workspace_id)}, {_sql_str(product)}, {_sql_str(workload_id)}, "
             f"{_sql_str(workload_name or workload_id)}, {1 if is_serverless else 0}, "
-            f"{_sql_str(k)}, {_sql_str(v)}, NULL, 'PENDING', 0)")
+            f"{_sql_str(k)}, {_sql_str(v)}, {cost_sql}, 'PENDING', 0)")
     values = ",\n  ".join(rows)
     return f"""
 INSERT INTO {QUEUE_TABLE}

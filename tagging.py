@@ -260,7 +260,8 @@ def _requested_by() -> str:
     return os.environ.get("TAG_GOVERNANCE_USER") or "app"
 
 
-def enqueue_single(plan: "TagPlan", workspace_id: str, is_serverless: bool = False) -> dict:
+def enqueue_single(plan: "TagPlan", workspace_id: str, is_serverless: bool = False,
+                   list_cost: float | None = None) -> dict:
     """Enqueue one workload's tags. Returns {batch_id, count} or UNSUPPORTED."""
     import db
     import queries
@@ -272,6 +273,7 @@ def enqueue_single(plan: "TagPlan", workspace_id: str, is_serverless: bool = Fal
         batch_id=batch_id, requested_by=_requested_by(), workspace_id=workspace_id,
         product=plan.product, workload_id=plan.workload_id,
         workload_name=plan.workload_name, is_serverless=is_serverless, tags=plan.tags,
+        list_cost=list_cost,
     )
     db.run_exec(sql)
     return {"status": "ENQUEUED", "batch_id": batch_id, "count": len(plan.tags),
@@ -298,7 +300,8 @@ def enqueue_bulk(days: int, tag_keys: list, rules: list, workspaces=None) -> dic
     return {"status": "ENQUEUED", "batch_id": batch_id, "rows": inserted}
 
 
-def approve(plan: TagPlan, workspace_id: str = "", is_serverless: bool = False) -> dict:
+def approve(plan: TagPlan, workspace_id: str = "", is_serverless: bool = False,
+            list_cost: float | None = None) -> dict:
     """Approve the plan by enqueuing it for the writer job.
 
     This no longer writes (or pretends to write) inline — it records intent into
@@ -309,4 +312,5 @@ def approve(plan: TagPlan, workspace_id: str = "", is_serverless: bool = False) 
     if not plan.supported:
         return {"status": "UNSUPPORTED",
                 "message": f"No tag-write path for product '{plan.product}' yet."}
-    return enqueue_single(plan, workspace_id=workspace_id, is_serverless=is_serverless)
+    return enqueue_single(plan, workspace_id=workspace_id, is_serverless=is_serverless,
+                          list_cost=list_cost)

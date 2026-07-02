@@ -364,7 +364,8 @@ with tab_tag:
                 elif st.button("2 · Queue tag change", type="primary", key=f"approve_{wid}"):
                     res = tagging.approve(
                         plan, workspace_id=str(sel["workspace_id"]),
-                        is_serverless=bool(sel["is_serverless"] == 1))
+                        is_serverless=bool(sel["is_serverless"] == 1),
+                        list_cost=float(sel["untagged_cost"]))
                     approvals[wid] = {
                         "tags": pend["tags"], "product": pend["product"],
                         "workload_name": pend["workload_name"],

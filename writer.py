@@ -36,6 +36,7 @@ class WriteResult:
     new_value: str | None  # value of the key after (None if not written)
     error: str | None = None
     noop: bool = False     # key already had the target value
+    dry_run: bool = False  # computed old→new but did NOT mutate the resource
 
     @classmethod
     def unsupported(cls, reason: str) -> "WriteResult":
@@ -46,8 +47,10 @@ class WriteResult:
         return cls(status="FAILED", old_value=old, new_value=None, error=reason)
 
     @classmethod
-    def ok(cls, old: str | None, new: str, noop: bool = False) -> "WriteResult":
-        return cls(status="SUCCEEDED", old_value=old, new_value=new, noop=noop)
+    def ok(cls, old: str | None, new: str, noop: bool = False,
+           dry_run: bool = False) -> "WriteResult":
+        return cls(status="SUCCEEDED", old_value=old, new_value=new,
+                   noop=noop, dry_run=dry_run)
 
 
 # Products that bill through serverless / policy attribution and cannot take a
@@ -87,7 +90,8 @@ def _apply_merge(current: dict, key: str, value: str | None):
     return old, new, False
 
 
-def _write_job(client, workload_id: str, name: str, key: str, value: str | None) -> WriteResult:
+def _write_job(client, workload_id: str, name: str, key: str, value: str | None,
+               dry_run: bool = False) -> WriteResult:
     try:
         job_id = int(workload_id)
     except (TypeError, ValueError):
@@ -98,6 +102,8 @@ def _write_job(client, workload_id: str, name: str, key: str, value: str | None)
     old, merged, noop = _apply_merge(current, key, value)
     if noop:
         return WriteResult.ok(old, value, noop=True)
+    if dry_run:
+        return WriteResult.ok(old, value, dry_run=True)
     # NOTE: jobs.update MERGES the tags map — omitting a key does NOT remove it,
     # so update can't do rollback (key removal). jobs.reset does a full settings
     # REPLACE, which sets tags to exactly `merged`. We read the complete settings
@@ -107,12 +113,15 @@ def _write_job(client, workload_id: str, name: str, key: str, value: str | None)
     return WriteResult.ok(old, value)
 
 
-def _write_cluster(client, workload_id: str, name: str, key: str, value: str | None) -> WriteResult:
+def _write_cluster(client, workload_id: str, name: str, key: str, value: str | None,
+                   dry_run: bool = False) -> WriteResult:
     c = client.clusters.get(cluster_id=workload_id)
     current = dict(c.custom_tags or {})
     old, merged, noop = _apply_merge(current, key, value)
     if noop:
         return WriteResult.ok(old, value, noop=True)
+    if dry_run:
+        return WriteResult.ok(old, value, dry_run=True)
     # clusters.edit requires the full spec; carry forward the identifying fields.
     client.clusters.edit(
         cluster_id=workload_id,
@@ -125,7 +134,8 @@ def _write_cluster(client, workload_id: str, name: str, key: str, value: str | N
     return WriteResult.ok(old, value)
 
 
-def _write_warehouse(client, workload_id: str, name: str, key: str, value: str | None) -> WriteResult:
+def _write_warehouse(client, workload_id: str, name: str, key: str, value: str | None,
+                     dry_run: bool = False) -> WriteResult:
     from databricks.sdk.service.sql import EndpointTags, EndpointTagPair
     w = client.warehouses.get(id=workload_id)
     pairs = list(w.tags.custom_tags) if (w.tags and w.tags.custom_tags) else []
@@ -133,23 +143,29 @@ def _write_warehouse(client, workload_id: str, name: str, key: str, value: str |
     old, merged, noop = _apply_merge(current, key, value)
     if noop:
         return WriteResult.ok(old, value, noop=True)
+    if dry_run:
+        return WriteResult.ok(old, value, dry_run=True)
     tags = EndpointTags(custom_tags=[EndpointTagPair(key=k, value=v) for k, v in merged.items()])
     client.warehouses.edit(id=workload_id, tags=tags)
     return WriteResult.ok(old, value)
 
 
-def _write_serving(client, workload_id: str, name: str, key: str, value: str | None) -> WriteResult:
+def _write_serving(client, workload_id: str, name: str, key: str, value: str | None,
+                   dry_run: bool = False) -> WriteResult:
     from databricks.sdk.service.serving import EndpointTag
     ep_name = name or workload_id  # patch keys on endpoint name (carried as workload_name)
-    try:
-        ep = client.serving_endpoints.get(name=ep_name)
-        tags = getattr(ep, "tags", None) or []
-        current = {t.key: t.value for t in tags}
-    except Exception:
-        current = {}
+    # Do NOT swallow a GET failure into current={}: that would record old_value=None
+    # for a resource that may actually have a prior value, and a later rollback would
+    # then delete a tag it should have restored. Let a GET error propagate to
+    # attempt_write's boundary → FAILED (safe: nothing written, nothing mis-audited).
+    ep = client.serving_endpoints.get(name=ep_name)
+    tags = getattr(ep, "tags", None) or []
+    current = {t.key: t.value for t in tags}
     old, _, noop = _apply_merge(current, key, value)
     if noop:
         return WriteResult.ok(old, value, noop=True)
+    if dry_run:
+        return WriteResult.ok(old, value, dry_run=True)
     if value is None:
         # rollback: remove the key we added.
         client.serving_endpoints.patch(name=ep_name, delete_tags=[key])
@@ -159,7 +175,8 @@ def _write_serving(client, workload_id: str, name: str, key: str, value: str | N
     return WriteResult.ok(old, value)
 
 
-def _write_lakebase(client, workload_id: str, name: str, key: str, value: str | None) -> WriteResult:
+def _write_lakebase(client, workload_id: str, name: str, key: str, value: str | None,
+                    dry_run: bool = False) -> WriteResult:
     # database service is only in newer SDKs — feature-detect so old runtimes
     # report UNSUPPORTED instead of raising AttributeError.
     db = getattr(client, "database", None)
@@ -173,19 +190,25 @@ def _write_lakebase(client, workload_id: str, name: str, key: str, value: str | 
         old, merged, noop = _apply_merge(current, key, value)
         if noop:
             return WriteResult.ok(old, value, noop=True)
+        if dry_run:
+            return WriteResult.ok(old, value, dry_run=True)
         db.update_database_instance(name=name or workload_id, custom_tags=merged)
         return WriteResult.ok(old, value)
     except Exception as e:  # noqa: BLE001 — best-effort, surface the reason
         return WriteResult.failed(f"Lakebase tag write failed: {e}")
 
 
-def _write_vector_search(client, workload_id: str, name: str, key: str, value: str) -> WriteResult:
+def _write_vector_search(client, workload_id: str, name: str, key: str, value: str,
+                         dry_run: bool = False) -> WriteResult:
     vs = getattr(client, "vector_search_endpoints", None)
     fn = getattr(vs, "update_endpoint_custom_tags", None) if vs else None
     if fn is None:
         return WriteResult.unsupported(
             "Installed databricks-sdk has no Vector Search tag API; upgrade the SDK to tag it."
         )
+    if dry_run:
+        # No cheap read of current VS tags here, so old_value is unknown in dry-run.
+        return WriteResult.ok(None, value, dry_run=True)
     try:
         fn(endpoint_name=name or workload_id, custom_tags={key: value})
         return WriteResult.ok(None, value)
@@ -193,7 +216,8 @@ def _write_vector_search(client, workload_id: str, name: str, key: str, value: s
         return WriteResult.failed(f"Vector Search tag write failed: {e}")
 
 
-def _write_pipeline(client, workload_id: str, name: str, key: str, value: str) -> WriteResult:
+def _write_pipeline(client, workload_id: str, name: str, key: str, value: str,
+                    dry_run: bool = False) -> WriteResult:
     # DLT has no top-level tags field; tags live on the pipeline's cluster specs.
     # Editing cluster specs safely requires replaying the full pipeline definition,
     # which is risky to do blind. Report UNSUPPORTED with guidance rather than
@@ -204,11 +228,13 @@ def _write_pipeline(client, workload_id: str, name: str, key: str, value: str) -
     )
 
 
-# product -> writer function
+# product -> writer function. INTERACTIVE is intentionally NOT here: it's in
+# POLICY_GOVERNED_REASON (billed as background/interactive usage, not an
+# individually taggable resource), so attempt_write short-circuits it to
+# UNSUPPORTED before dispatch. All-purpose clusters come through as ALL_PURPOSE.
 _WRITERS = {
     "JOBS": _write_job,
     "ALL_PURPOSE": _write_cluster,
-    "INTERACTIVE": _write_cluster,   # overridden by POLICY_GOVERNED below if no cluster_id
     "SQL": _write_warehouse,          # non-serverless warehouses only (see attempt_write)
     "DATABASE": _write_warehouse,
     "MODEL_SERVING": _write_serving,
@@ -219,13 +245,15 @@ _WRITERS = {
 
 
 def attempt_write(client, product: str, workload_id: str, workload_name: str,
-                  key: str, value: str | None, is_serverless: bool = False) -> WriteResult:
+                  key: str, value: str | None, is_serverless: bool = False,
+                  dry_run: bool = False) -> WriteResult:
     """Best-effort: tag one resource, or return UNSUPPORTED/FAILED with a reason.
 
     value=None means REMOVE the key (used by rollback to restore a previously
-    absent key). Never raises — a bad row must not kill the batch. Serverless SQL
-    and Apps are reported as policy-governed; unknown products and SDK gaps are
-    UNSUPPORTED.
+    absent key). dry_run=True reads the resource and computes old→new but does
+    NOT mutate it (status SUCCEEDED with dry_run=True). Never raises — a bad row
+    must not kill the batch. Serverless SQL and Apps are reported as
+    policy-governed; unknown products and SDK gaps are UNSUPPORTED.
     """
     # Serverless SQL is policy-governed even though non-serverless SQL warehouses
     # are taggable — decide by the flag before dispatch.
@@ -238,6 +266,6 @@ def attempt_write(client, product: str, workload_id: str, workload_name: str,
     if writer is None:
         return WriteResult.unsupported(f"No tag-write path for product '{product}'.")
     try:
-        return writer(client, workload_id, workload_name, key, value)
+        return writer(client, workload_id, workload_name, key, value, dry_run=dry_run)
     except Exception as e:  # noqa: BLE001 — best-effort boundary
         return WriteResult.failed(f"{type(e).__name__}: {e}")
