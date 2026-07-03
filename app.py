@@ -145,9 +145,12 @@ try:
     fr = db.run_query(queries.freshness())
     if not fr.empty and fr.iloc[0]["as_of"] is not None:
         as_of_txt = f" · data as of <b>{fr.iloc[0]['as_of']}</b>"
-    st.session_state["warmed"] = True
 except Exception:
     pass
+finally:
+    # Mark warmed even if the query failed — the warehouse is awake either way, so
+    # the "warming up" banner shouldn't linger forever on a transient query error.
+    st.session_state["warmed"] = True
 
 st.markdown(
     f"<p class='hero-sub'>Last <b>{days} days</b> across every billing product · "
@@ -519,7 +522,9 @@ elif view == VIEWS[2]:  # Bulk tag (rules)
                          type="primary", disabled=matched_cnt == 0):
                 res = tagging.enqueue_bulk(days, tag_keys, rset, workspaces)
                 if res.get("status") == "ENQUEUED":
-                    st.success(f"✅ Queued batch `{res['batch_id']}` — {res.get('rows', matched_cnt):,} "
+                    rows = res.get("rows")
+                    rows = rows if rows is not None else matched_cnt  # driver may not report rowcount
+                    st.success(f"✅ Queued batch `{res['batch_id']}` — {rows:,} "
                                f"queue rows, {fmt_money(matched_cost)} now attributable once applied.")
                     st.caption("Open the **Batches & Rollback** tab to run the writer and track status.")
                 else:
@@ -581,7 +586,10 @@ elif view == VIEWS[3]:  # Bulk tag (AI)
                 sql = queries.enqueue_from_suggestions_sql(
                     batch_id, tagging._requested_by(), tag_key, min_conf, days, workspaces)
                 inserted = db.run_exec(sql)
-                st.success(f"✅ Queued batch `{batch_id}` — {inserted:,} workloads, "
+                # Some drivers don't report a rowcount for INSERT (run_exec → -1);
+                # fall back to the previewed count rather than show "-1 workloads".
+                shown = inserted if inserted is not None and inserted >= 0 else n
+                st.success(f"✅ Queued batch `{batch_id}` — {shown:,} workloads, "
                            f"{fmt_money(cost)} attributable once applied.")
                 st.caption("Open **Batches & Rollback** to run the writer and track status.")
 

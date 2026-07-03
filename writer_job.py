@@ -129,13 +129,19 @@ def run():
     except Exception:
         pass
     # Load account-SP creds from the secret scope (if provided) to enable M2.
+    # If a scope was explicitly configured but the creds don't load, FAIL LOUD —
+    # silently downgrading to M1 would tag only the home workspace and report
+    # success, leaving the other workspaces' rows silently untouched.
     scope = _param("account_sp_scope") or ""
     if scope:
-        try:
-            from databricks.sdk.runtime import dbutils
-            ws_clients.load_account_creds_from_scope(scope, dbutils)
-        except Exception:
-            pass
+        from databricks.sdk.runtime import dbutils
+        if not ws_clients.load_account_creds_from_scope(scope, dbutils):
+            raise SystemExit(
+                f"account_sp_scope='{scope}' was set but its account-SP creds could not "
+                f"be loaded (missing scope or one of keys account_id/client_id/"
+                f"client_secret). Refusing to silently downgrade to home-only. Fix the "
+                f"scope, or clear account_sp_scope to run M1 intentionally."
+            )
     resolver = ws_clients.ClientResolver(home_client, home_workspace_id=home_ws)
 
     # Scope the drain:

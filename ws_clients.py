@@ -64,35 +64,42 @@ class ClientResolver:
     per-workspace clients. One instance per job run (holds the home client)."""
 
     def __init__(self, home_client, home_workspace_id: str | None = None):
+        import threading
         self._home = home_client
         self._home_ws = str(home_workspace_id) if home_workspace_id else None
         self._account = None
         self._ws_index = None          # workspace_id(str) -> Workspace
         self._cache: dict[str, object] = {}
         self._m2 = account_creds_present()
+        # The writer/rollback jobs call client_for() from up to 14 concurrent
+        # workspace threads; the lazy inits below are check-then-set, so guard them.
+        # RLock because _index() calls _account_client() while holding the lock.
+        self._lock = threading.RLock()
 
     @property
     def cross_workspace(self) -> bool:
         return self._m2
 
     def _account_client(self):
-        if self._account is None:
-            from databricks.sdk import AccountClient
-            self._account = AccountClient(
-                host=_ACCOUNT_HOST,
-                account_id=os.environ["DATABRICKS_ACCOUNT_ID"],
-                client_id=os.environ["DATABRICKS_CLIENT_ID"],
-                client_secret=os.environ["DATABRICKS_CLIENT_SECRET"],
-            )
-        return self._account
+        with self._lock:
+            if self._account is None:
+                from databricks.sdk import AccountClient
+                self._account = AccountClient(
+                    host=_ACCOUNT_HOST,
+                    account_id=os.environ["DATABRICKS_ACCOUNT_ID"],
+                    client_id=os.environ["DATABRICKS_CLIENT_ID"],
+                    client_secret=os.environ["DATABRICKS_CLIENT_SECRET"],
+                )
+            return self._account
 
     def _index(self) -> dict:
-        if self._ws_index is None:
-            self._ws_index = {
-                str(ws.workspace_id): ws
-                for ws in self._account_client().workspaces.list()
-            }
-        return self._ws_index
+        with self._lock:
+            if self._ws_index is None:
+                self._ws_index = {
+                    str(ws.workspace_id): ws
+                    for ws in self._account_client().workspaces.list()
+                }
+            return self._ws_index
 
     def client_for(self, workspace_id: str):
         """Return a WorkspaceClient for workspace_id, or raise if unreachable.
@@ -110,9 +117,10 @@ class ClientResolver:
                 f"are configured (M1). Set DATABRICKS_ACCOUNT_ID/CLIENT_ID/CLIENT_SECRET "
                 f"to enable cross-workspace writes."
             )
-        if wid not in self._cache:
-            ws = self._index().get(wid)
-            if ws is None:
-                raise RuntimeError(f"workspace {wid} not found in account workspace listing")
-            self._cache[wid] = self._account_client().get_workspace_client(ws)
-        return self._cache[wid]
+        with self._lock:
+            if wid not in self._cache:
+                ws = self._index().get(wid)
+                if ws is None:
+                    raise RuntimeError(f"workspace {wid} not found in account workspace listing")
+                self._cache[wid] = self._account_client().get_workspace_client(ws)
+            return self._cache[wid]

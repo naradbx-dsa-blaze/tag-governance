@@ -297,7 +297,10 @@ def enqueue_bulk(days: int, tag_keys: list, rules: list, workspaces=None) -> dic
     if sql is None:
         return {"status": "NO_RULES", "message": "No valid rules to enqueue."}
     inserted = db.run_exec(sql)
-    return {"status": "ENQUEUED", "batch_id": batch_id, "rows": inserted}
+    # run_exec returns -1 when the driver reports no rowcount for DML; surface None
+    # so the UI falls back to the previewed count instead of showing "-1".
+    rows = inserted if (inserted is not None and inserted >= 0) else None
+    return {"status": "ENQUEUED", "batch_id": batch_id, "rows": rows}
 
 
 def approve(plan: TagPlan, workspace_id: str = "", is_serverless: bool = False,

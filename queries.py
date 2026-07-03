@@ -46,10 +46,14 @@ _AGG_KEYS = "array_distinct(flatten(collect_list(tag_keys)))"
 
 
 def _missing_keys_predicate(tag_keys, col="tag_keys"):
-    """True when the workload is missing ALL chosen keys."""
+    """True when the workload is missing ALL chosen keys.
+
+    Keys are user-chosen (sidebar), so escape single quotes to avoid a broken
+    literal / injection on a key name like O'Brien-cost.
+    """
     if not tag_keys:
         return f"size({col}) = 0"
-    arr = ", ".join(f"'{k}'" for k in tag_keys)
+    arr = ", ".join("'" + str(k).replace("'", "''") + "'" for k in tag_keys)
     return f"NOT arrays_overlap({col}, array({arr}))"
 
 

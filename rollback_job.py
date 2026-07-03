@@ -76,11 +76,12 @@ def run():
         pass
     scope = _param("account_sp_scope") or ""
     if scope:
-        try:
-            from databricks.sdk.runtime import dbutils
-            ws_clients.load_account_creds_from_scope(scope, dbutils)
-        except Exception:
-            pass
+        from databricks.sdk.runtime import dbutils
+        if not ws_clients.load_account_creds_from_scope(scope, dbutils):
+            raise SystemExit(
+                f"account_sp_scope='{scope}' was set but its account-SP creds could not "
+                f"be loaded; refusing to silently downgrade to home-only for rollback."
+            )
     resolver = ws_clients.ClientResolver(home_client, home_workspace_id=home_ws)
 
     # The forward SETs we need to undo. Take the LATEST SET per (workload, key)
@@ -135,6 +136,10 @@ def run():
                     local.append(_audit_row(batch_id, executed_by, row, target,
                                             status="DRY_RUN", error=None))
                     continue
+                # is_serverless defaults False, which is always correct here: only
+                # a SUCCEEDED SET is rolled back, and serverless SQL/Apps never
+                # produce one (they're UNSUPPORTED, never audited). So a
+                # serverless-SQL row can't reach this path to be mis-dispatched.
                 futures[pool.submit(
                     writer.attempt_write, client, row["product"], row["workload_id"],
                     None, row["tag_key"], target)] = row
