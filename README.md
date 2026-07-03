@@ -9,6 +9,8 @@ ranks them by cost, and lets you apply your own tag keys in place — with a saf
 > tagged, so cost can't be attributed back to teams. Account-wide and
 > customer-portable — deploy it into any Databricks account in minutes.
 
+**Live demo (e2-demo-field-eng):** https://tag-governance-1444828305810485.aws.databricksapps.com
+
 ---
 
 ## What it does
@@ -85,6 +87,29 @@ WRITE PATH (app never mutates a resource):
 | `app.yaml` | Apps runtime config |
 | `databricks.yml` | DAB bundle (app + refresh/writer/rollback jobs) with `*_table` variables |
 | `requirements.txt` | streamlit, databricks-sql-connector, databricks-sdk, pandas |
+
+---
+
+## Customer readiness checklist
+
+An honest view of what's proven vs. what needs a one-time setup, so there are no
+surprises in front of a customer.
+
+| Capability | Status | Notes |
+|------------|--------|-------|
+| **Scans account-wide, all products** | ✅ Proven | `system.billing.usage` is account-wide; workspaces auto-discover. |
+| **Scales to the full fleet** | ✅ Proven | Enqueue = one warehouse `INSERT…SELECT` (measured 6,170 rows, no client round-trip); rules evaluated in-warehouse over 50k+ workloads. |
+| **Safe writes (queue → job → audit → rollback)** | ✅ Proven | App never mutates; writer job is idempotent, cost-descending, 429-backoff, resumable. Dry-run truly writes nothing. Verified on a live job. |
+| **Rollback** | ✅ Proven | Restores every tag to its pre-batch value (or removes a key it added). Verified live. |
+| **Portable to any account** | ✅ By design | No account-specific values in code — only bundle-var defaults. Change `warehouse_id` + table vars; touch zero code. |
+| **Tag writes: Jobs / clusters / warehouses / serving** | ✅ Proven (M1) | Live-verified in the home workspace. ~59% of untagged cost. |
+| **Lakebase / Vector Search writes** | ⚠️ SDK-gated | Work on a current `databricks-sdk`; older runtimes return `UNSUPPORTED` (feature-detected, never crash). Confirm the job runtime SDK version. |
+| **Cross-workspace writes (M2)** | ⚠️ Code-verified, not live | M1 (home) fully proven. M2 needs an account SP assigned to workspaces with `CAN_MANAGE` (one-time admin step) — then it fans out. See "Cross-workspace writes (M2)". |
+| **Serverless SQL / Apps (~41% of spend)** | ℹ️ Reported, not tagged | Not per-resource taggable — attribute via **budget/tag policy**. The tool flags these as `UNSUPPORTED` with a reason (honest, not silent). |
+| **Advisory AI suggestions** | ✅ Proven | `ai_query` hint column; conservative (low-confidence `unknown` for cryptic workloads); never writes. |
+
+**Ship-ready today at the M1 tier + honest reporting.** Full-account M2 is one
+documented admin step (provision + entitle the account SP) away from live.
 
 ---
 
