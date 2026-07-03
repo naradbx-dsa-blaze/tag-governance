@@ -33,6 +33,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.runtime import spark  # available in the job runtime
 
 import writer
+import ws_clients
 
 # Backoff for rate limits (HTTP 429 / "rate limit" in the message).
 _MAX_RETRIES = 5
@@ -71,17 +72,6 @@ def _is_rate_limited(result: writer.WriteResult) -> bool:
         return False
     e = result.error.lower()
     return "429" in e or "rate limit" in e or "too many requests" in e
-
-
-def _client_for_workspace(workspace_id: str, home_client: WorkspaceClient) -> WorkspaceClient:
-    """Return a WorkspaceClient valid in the target workspace.
-
-    M1 (home-workspace mode): everything runs against the job's own workspace, so
-    we reuse home_client. M2 (cross-workspace): build a per-workspace client from
-    the account SP here — the only code that changes when fanning out. Kept as a
-    single seam so M2 is a localized change, not a rewrite.
-    """
-    return home_client  # M1: home workspace only
 
 
 def _apply_row(client, row, dry_run: bool) -> writer.WriteResult:
@@ -133,24 +123,42 @@ def run():
     except Exception:
         pass
 
-    # M1 SAFETY: the writer only has a home-workspace client (_client_for_workspace
-    # always returns it), so it must never attempt foreign-workspace rows — a
-    # colliding resource id would be mis-tagged in the home workspace. If no
-    # workspace_id was passed, default to THIS workspace rather than draining all.
-    if not only_workspace:
+    home_ws = None
+    try:
+        home_ws = str(home_client.get_workspace_id())
+    except Exception:
+        pass
+    # Load account-SP creds from the secret scope (if provided) to enable M2.
+    scope = _param("account_sp_scope") or ""
+    if scope:
         try:
-            only_workspace = str(home_client.get_workspace_id())
-            print(f"workspace_id not set — defaulting to home workspace {only_workspace} (M1).")
+            from databricks.sdk.runtime import dbutils
+            ws_clients.load_account_creds_from_scope(scope, dbutils)
         except Exception:
+            pass
+    resolver = ws_clients.ClientResolver(home_client, home_workspace_id=home_ws)
+
+    # Scope the drain:
+    #  - explicit workspace_id → just that workspace.
+    #  - M2 (account creds present) and no workspace_id → drain ALL workspaces.
+    #  - M1 (no account creds) and no workspace_id → default to home only, because
+    #    the resolver can't reach foreign workspaces and must not mis-tag with the
+    #    home client.
+    if not only_workspace and not resolver.cross_workspace:
+        if not home_ws:
             raise SystemExit(
-                "workspace_id not provided and home workspace id could not be resolved; "
-                "refusing to drain all workspaces with a home-only client (M1)."
+                "workspace_id not provided, home workspace id could not be resolved, "
+                "and no account-SP creds are set; refusing to run (M1 safety)."
             )
+        only_workspace = home_ws
+        print(f"M1 (no account creds) — defaulting to home workspace {only_workspace}.")
 
     def _q(v: str) -> str:  # escape single quotes for inline SQL
         return v.replace("'", "''")
 
-    where = ["status = 'PENDING'", f"workspace_id = '{_q(only_workspace)}'"]
+    where = ["status = 'PENDING'"]
+    if only_workspace:
+        where.append(f"workspace_id = '{_q(only_workspace)}'")
     if only_batch:
         where.append(f"batch_id = '{_q(only_batch)}'")
     where_sql = " AND ".join(where)
@@ -177,7 +185,18 @@ def run():
     queue_updates: list[dict] = []  # (batch_id, workload_id, tag_key) -> status/error
 
     def process_workspace(workspace_id: str, rows: list[dict]):
-        client = _client_for_workspace(workspace_id, home_client)
+        # Resolve the workspace client once per workspace. If it can't be built
+        # (M1 foreign workspace, or SP not assigned there), fail this workspace's
+        # rows cleanly instead of crashing the run or mis-tagging via home.
+        try:
+            client = resolver.client_for(workspace_id)
+        except Exception as e:  # noqa: BLE001
+            reason = f"no client for workspace {workspace_id}: {e}"
+            return [], [{
+                "batch_id": r["batch_id"], "workload_id": r["workload_id"],
+                "product": r["product"], "tag_key": r["tag_key"],
+                "status": "FAILED", "last_error": reason,
+            } for r in rows]
         local_audit, local_updates = [], []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_apply_row, client, row, dry_run): row for row in rows}

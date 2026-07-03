@@ -28,6 +28,9 @@ variables:
   annotate_model:
     description: "Model/endpoint name used by the advisory ai_query annotation"
     default: databricks-meta-llama-3-3-70b-instruct
+  account_sp_scope:
+    description: "Secret scope with the account-SP OAuth creds for M2 cross-workspace writes (empty = M1 home only)"
+    default: ""
 
 resources:
   jobs:
@@ -80,6 +83,11 @@ resources:
           default: ""
         - name: max_workers
           default: "4"
+        # Secret scope holding the ACCOUNT-level SP OAuth creds (keys: account_id,
+        # client_id, client_secret). Empty = M1 (home workspace only). Set it to
+        # enable M2 cross-workspace writes. Passed as a scope NAME, not the secrets.
+        - name: account_sp_scope
+          default: ${var.account_sp_scope}
       tasks:
         - task_key: drain_queue
           spark_python_task:
@@ -93,6 +101,7 @@ resources:
               - workspace_id={{job.parameters.workspace_id}}
               - batch_id={{job.parameters.batch_id}}
               - max_workers={{job.parameters.max_workers}}
+              - account_sp_scope={{job.parameters.account_sp_scope}}
           environment_key: default
       environments:
         - environment_key: default
@@ -112,6 +121,8 @@ resources:
           default: "true"
         - name: max_workers
           default: "4"
+        - name: account_sp_scope
+          default: ${var.account_sp_scope}
       tasks:
         - task_key: rollback_batch
           spark_python_task:
@@ -121,6 +132,7 @@ resources:
               - batch_id={{job.parameters.batch_id}}
               - dry_run={{job.parameters.dry_run}}
               - max_workers={{job.parameters.max_workers}}
+              - account_sp_scope={{job.parameters.account_sp_scope}}
           environment_key: default
       environments:
         - environment_key: default

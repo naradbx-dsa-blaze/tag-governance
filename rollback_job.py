@@ -25,6 +25,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.runtime import spark
 
 import writer
+import ws_clients
 
 
 def _parse_argv() -> dict:
@@ -53,11 +54,6 @@ def _param(name: str, default: str | None = None) -> str | None:
     return default
 
 
-def _client_for_workspace(workspace_id: str, home_client: WorkspaceClient) -> WorkspaceClient:
-    """M1: home workspace only. M2 seam: build per-workspace client here."""
-    return home_client
-
-
 def run():
     audit_table = _param("audit_table")
     batch_id = _param("batch_id")
@@ -73,10 +69,24 @@ def run():
         executed_by = home_client.current_user.me().user_name
     except Exception:
         pass
+    home_ws = None
+    try:
+        home_ws = str(home_client.get_workspace_id())
+    except Exception:
+        pass
+    scope = _param("account_sp_scope") or ""
+    if scope:
+        try:
+            from databricks.sdk.runtime import dbutils
+            ws_clients.load_account_creds_from_scope(scope, dbutils)
+        except Exception:
+            pass
+    resolver = ws_clients.ClientResolver(home_client, home_workspace_id=home_ws)
 
     # The forward SETs we need to undo. Take the LATEST SET per (workload, key)
     # so repeated tagging rolls back to the value before the batch, and skip keys
-    # already rolled back.
+    # already rolled back. batch_id is escaped to keep the literal safe.
+    b = batch_id.replace("'", "''")
     to_undo = spark.sql(f"""
         WITH sets AS (
           SELECT workspace_id, product, workload_id, tag_key, old_value, new_value,
@@ -84,7 +94,7 @@ def run():
                    PARTITION BY workload_id, tag_key ORDER BY executed_at DESC
                  ) AS rn
           FROM {audit_table}
-          WHERE batch_id = '{batch_id}' AND action = 'SET' AND status = 'SUCCEEDED'
+          WHERE batch_id = '{b}' AND action = 'SET' AND status = 'SUCCEEDED'
         )
         SELECT workspace_id, product, workload_id, tag_key, old_value, new_value
         FROM sets WHERE rn = 1
@@ -103,7 +113,17 @@ def run():
     audit_rows: list[dict] = []
 
     def process_workspace(workspace_id: str, rows: list[dict]):
-        client = _client_for_workspace(workspace_id, home_client)
+        # In dry-run we don't need a client at all (no mutation). For live rollback,
+        # resolve the workspace client; if it can't be built, fail those rows.
+        client = None
+        if not dry_run:
+            try:
+                client = resolver.client_for(workspace_id)
+            except Exception as e:  # noqa: BLE001
+                return [_audit_row(batch_id, executed_by, r, r["old_value"],
+                                   status="FAILED",
+                                   error=f"no client for workspace {workspace_id}: {e}")
+                        for r in rows]
         local = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {}
@@ -111,8 +131,9 @@ def run():
                 # Restore old_value; None removes the key we had added.
                 target = row["old_value"]
                 if dry_run:
+                    # DRY_RUN status so a dry run is not mistaken for a real restore.
                     local.append(_audit_row(batch_id, executed_by, row, target,
-                                            status="SUCCEEDED", error="DRY_RUN"))
+                                            status="DRY_RUN", error=None))
                     continue
                 futures[pool.submit(
                     writer.attempt_write, client, row["product"], row["workload_id"],

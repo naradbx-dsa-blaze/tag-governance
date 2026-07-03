@@ -80,6 +80,7 @@ WRITE PATH (app never mutates a resource):
 | `tagging.py` | Per-product API map + `plan_for`/`preview` + `enqueue_single`/`enqueue_bulk` |
 | `writer.py` | Per-product live tag writes (GET→MERGE→PUT, idempotent, best-effort) |
 | `writer_job.py` | Drains the queue cost-descending, per-workspace + 429 backoff, writes audit |
+| `ws_clients.py` | Resolves workspace_id → WorkspaceClient (M1 home-only / M2 account-SP); shared by both jobs |
 | `rollback_job.py` | Undoes a batch by replaying the audit in reverse |
 | `app.yaml` | Apps runtime config |
 | `databricks.yml` | DAB bundle (app + refresh/writer/rollback jobs) with `*_table` variables |
@@ -220,11 +221,44 @@ policies** for that portion.
 
 ### Cross-workspace writes (M2)
 Reading billing is account-wide, but *writing* a tag to a resource in workspace X
-needs an identity valid **in workspace X**. M1 restricts the writer to the home
-workspace (`workspace_id=<HOME_WS_ID>`). For M2, provision an **account-level service
-principal** into each workspace and build a per-workspace `WorkspaceClient` in
-`writer_job._client_for_workspace` (the single seam that changes). Do **not** store
-PATs in the app.
+needs an identity valid **in workspace X**. The jobs support two modes automatically,
+chosen by whether account-SP creds are available (`ws_clients.ClientResolver`):
+
+- **M1 (default, no setup):** writes only the **home** workspace. Rows for any other
+  workspace are marked `FAILED` (never mis-tagged with the home client). If you don't
+  pass `workspace_id`, the writer defaults to the home workspace.
+- **M2 (cross-workspace):** with an account-level service principal configured, the
+  writer resolves a per-workspace `WorkspaceClient` for every workspace via
+  `AccountClient.get_workspace_client(...)` and can drain **all** workspaces at once.
+
+**Enable M2 (one-time):**
+1. **Create an account-level service principal** (Account Console → User management →
+   Service principals) and generate an **OAuth secret** (client ID + secret) for it.
+2. **Assign it to each target workspace** (Account Console → Workspaces → *Permissions*),
+   and grant it **`CAN_MANAGE`** on the resources it will tag (jobs, clusters, SQL
+   warehouses, serving endpoints). Workspace-admin is the simplest blanket grant. Tag
+   edits are *write* ops — read-only entitlements are not enough.
+3. **Store the creds in a Databricks secret scope** (keys exactly `account_id`,
+   `client_id`, `client_secret`):
+   ```bash
+   databricks secrets create-scope tag_governance_acct_sp
+   databricks secrets put-secret tag_governance_acct_sp account_id     # your account UUID
+   databricks secrets put-secret tag_governance_acct_sp client_id      # SP OAuth client id
+   databricks secrets put-secret tag_governance_acct_sp client_secret  # SP OAuth secret
+   ```
+4. **Point the jobs at the scope** — set the bundle var (or pass per-run):
+   ```bash
+   databricks bundle deploy --var account_sp_scope=tag_governance_acct_sp
+   # then drain ALL workspaces (omit workspace_id):
+   databricks bundle run tag-governance-writer -- --python-params dry_run=false
+   ```
+
+The scope **name** is passed as a job parameter; the secrets themselves are read at
+runtime via `dbutils.secrets` and never appear in job argv or logs. If the scope is
+empty or unreadable, the jobs stay in M1. Do **not** store PATs in the app.
+
+> **Seam:** all of this lives in `ws_clients.py` (shared by the writer and rollback
+> jobs). The per-product write code in `writer.py` is unchanged between M1 and M2.
 
 ---
 
