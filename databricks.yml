@@ -51,10 +51,20 @@ resources:
               path: ./materialize.sql
             parameters:
               summary_table: ${var.summary_table}
-        # Advisory ai_query suggestions rebuild after the summary refreshes.
+
+    # Advisory ai_query suggestions — a SEPARATE, WEEKLY job. The ai_query pass runs
+    # over the whole fleet (~50k workloads), so it's the one recurring inference
+    # cost here. Team→workload attribution doesn't churn daily, so weekly is plenty
+    # and keeps the customer's bill down. Runs Monday 07:13 ET, after the daily
+    # 06:00 materialize has refreshed the summary table it reads.
+    tag-governance-annotate:
+      name: tag-governance-annotate
+      description: "Weekly rebuild of advisory ai_query cost-center suggestions (kept weekly to limit inference cost)"
+      schedule:
+        quartz_cron_expression: "0 13 7 ? * MON"   # Mondays 07:13 ET
+        timezone_id: "America/New_York"
+      tasks:
         - task_key: annotate
-          depends_on:
-            - task_key: materialize
           sql_task:
             warehouse_id: ${var.warehouse_id}
             file:
