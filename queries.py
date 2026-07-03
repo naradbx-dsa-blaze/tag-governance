@@ -547,3 +547,95 @@ LEFT JOIN {SUGGESTIONS_TABLE} s
 ORDER BY wl.untagged_cost DESC
 LIMIT {limit}
 """
+
+
+# ----------------------------------------------------------------------------
+# Bulk tag FROM AI suggestions (threshold + one-click). The agent already
+# proposed a cost-center per workload (annotate.sql); this lets a human enqueue
+# ALL confident suggestions at once instead of typing thousands of values. The
+# human still gates the batch (picks the key + confidence cutoff, reviews the
+# count/cost, clicks once). A workload qualifies when it is untagged for the
+# chosen key, has a real (non-"unknown") suggestion, and confidence >= cutoff.
+# ----------------------------------------------------------------------------
+
+def _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces):
+    """Shared CTE: untagged workloads with a confident, real suggestion."""
+    # A workload is "untagged for this key" if the chosen key is absent.
+    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS)
+    return f"""
+WITH wl AS (
+  SELECT product, workload_id,
+         MAX(workspace_id)  AS workspace_id,
+         MAX(workload_name) AS workload_name,
+         MAX(is_serverless) AS is_serverless,
+         SUM(list_cost)     AS cost
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+  HAVING {untag_expr} AND SUM(list_cost) > 0
+),
+cand AS (
+  SELECT wl.product, wl.workload_id, wl.workspace_id, wl.workload_name,
+         wl.is_serverless, wl.cost,
+         s.suggested_cost_center, s.confidence
+  FROM wl
+  JOIN {SUGGESTIONS_TABLE} s
+    ON s.workload_id = wl.workload_id AND s.product = wl.product
+  WHERE s.suggested_cost_center IS NOT NULL
+    AND lower(s.suggested_cost_center) <> 'unknown'
+    AND s.confidence >= {float(min_confidence)}
+)"""
+
+
+def suggestions_bulk_impact(tag_key, min_confidence, days, workspaces=None):
+    """Aggregate impact of enqueuing all confident suggestions for `tag_key`."""
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
+    return cte + """
+SELECT COUNT(*)                              AS workloads,
+       ROUND(SUM(cost), 0)                   AS cost,
+       COUNT(DISTINCT suggested_cost_center) AS distinct_values
+FROM cand
+"""
+
+
+def suggestions_bulk_breakdown(tag_key, min_confidence, days, workspaces=None, limit=50):
+    """Per-suggested-value coverage, so the human sees WHAT would be assigned."""
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
+    return cte + f"""
+SELECT suggested_cost_center AS value,
+       COUNT(*)              AS workloads,
+       ROUND(SUM(cost), 0)   AS cost,
+       ROUND(MIN(confidence), 2) AS min_conf
+FROM cand
+GROUP BY suggested_cost_center
+ORDER BY cost DESC
+LIMIT {limit}
+"""
+
+
+def enqueue_from_suggestions_sql(batch_id, requested_by, tag_key, min_confidence,
+                                 days, workspaces=None):
+    """INSERT one queue row per confident suggestion — tag_value = the AI's pick.
+
+    This is the agent-driven bulk path: no per-workload typing. Evaluated entirely
+    in the warehouse, so 1000s of workloads enqueue in one statement. The CTE must
+    follow INSERT INTO (INSERT INTO t WITH cte AS (...) SELECT ...).
+    """
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
+    return f"""
+INSERT INTO {QUEUE_TABLE}
+  (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
+   workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
+{cte}
+SELECT
+  {_sql_str(batch_id)}      AS batch_id,
+  current_timestamp()       AS enqueued_at,
+  {_sql_str(requested_by)}  AS requested_by,
+  workspace_id, product, workload_id, workload_name, is_serverless,
+  {_sql_str(tag_key)}       AS tag_key,
+  suggested_cost_center     AS tag_value,
+  cost                      AS list_cost,
+  'PENDING'                 AS status,
+  0                         AS attempts
+FROM cand
+"""

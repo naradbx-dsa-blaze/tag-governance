@@ -130,13 +130,22 @@ st.sidebar.info(
 # ----------------------------------------------------------------------------- header
 st.title("Untagged Consumption Scanner")
 
+# First query of a session may wake a stopped serverless warehouse (~1-2 min,
+# one-time); everything after is sub-second on the pre-aggregated table. Tell the
+# user so a cold start doesn't read as "the app is slow / broken".
+if "warmed" not in st.session_state:
+    st.info("⏳ **Warming up** — the first scan may take a minute while the SQL "
+            "warehouse starts. After that, scans are near-instant for the session.")
+
 # Freshness of the pre-aggregated summary table (data is materialized daily, so
-# the app loads instantly rather than scanning raw billing on every open).
+# the app loads instantly rather than scanning raw billing on every open). This
+# first query is also what wakes the warehouse.
 as_of_txt = ""
 try:
     fr = db.run_query(queries.freshness())
     if not fr.empty and fr.iloc[0]["as_of"] is not None:
         as_of_txt = f" · data as of <b>{fr.iloc[0]['as_of']}</b>"
+    st.session_state["warmed"] = True
 except Exception:
     pass
 
@@ -174,12 +183,15 @@ kpi_card(c4, "📦 Untagged workloads", f"{int(nwk):,}" if pd.notna(nwk) else "�
 
 st.divider()
 
-tab_scan, tab_tag, tab_bulk, tab_batches, tab_about = st.tabs(
-    ["📊  Scan", "🏷️  Tag & Verify", "⚡  Bulk tag (rules)",
-     "📬  Batches & Rollback", "ℹ️  How it works"])
+# View switcher (NOT st.tabs): st.tabs runs EVERY tab's body on every rerun, which
+# fired ~8 warehouse queries per load. A radio renders only the selected view, so
+# each interaction runs just that view's queries — big cold-start win.
+VIEWS = ["📊  Scan", "🏷️  Tag & Verify", "⚡  Bulk tag (rules)",
+         "🤖  Bulk tag (AI)", "📬  Batches & Rollback", "ℹ️  How it works"]
+view = st.radio("View", VIEWS, horizontal=True, label_visibility="collapsed")
 
 # ============================================================================= SCAN
-with tab_scan:
+if view == VIEWS[0]:  # Scan
     left, right = st.columns([1, 1])
 
     prod = db.run_query(queries.by_product(days, tag_keys, workspaces))
@@ -272,7 +284,7 @@ with tab_scan:
         st.session_state["leaderboard"] = lb
 
 # ============================================================================= TAG
-with tab_tag:
+elif view == VIEWS[1]:  # Tag & Verify
     lb = st.session_state.get("leaderboard")
     if lb is None or lb.empty:
         st.info("Run a scan first — then pick a workload here to tag it.")
@@ -408,7 +420,7 @@ with tab_tag:
             st.caption("Track and apply these in the **Batches & Rollback** tab.")
 
 # ============================================================================= BULK
-with tab_bulk:
+elif view == VIEWS[2]:  # Bulk tag (rules)
     st.subheader("Tag thousands of workloads with a few rules")
     st.caption("Each rule attributes every matching workload at once. Earlier rules "
                "win on conflict. Preview the full impact before applying — nothing "
@@ -513,8 +525,68 @@ with tab_bulk:
                 else:
                     st.warning(res.get("message", "Nothing to queue."))
 
+# ============================================================================= BULK (AI)
+elif view == VIEWS[3]:  # Bulk tag (AI)
+    st.subheader("Tag thousands of workloads from AI suggestions")
+    st.caption("The 🤖 classifier already proposed a cost-center for each workload. "
+               "Pick the tag key and a confidence cutoff, review the impact, and queue "
+               "them all in one click — no typing thousands of values. A human still "
+               "gates the batch; the writer job applies it (dry-run by default).")
+
+    if not tag_keys:
+        st.warning("Choose your chargeback keys in the sidebar first.")
+    else:
+        ccol1, ccol2 = st.columns([1.4, 1])
+        tag_key = ccol1.selectbox(
+            "Tag key to assign", tag_keys,
+            help="The AI's suggested value goes into THIS key on each workload.")
+        min_conf = ccol2.slider("Min confidence", 0.0, 1.0, 0.8, 0.05,
+                                help="Only enqueue suggestions the model is at least this confident about.")
+
+        impact = db.run_query(queries.suggestions_bulk_impact(tag_key, min_conf, days, workspaces))
+        irow = impact.iloc[0] if not impact.empty else pd.Series(dtype="float64")
+        n = int(irow.get("workloads") or 0)
+        cost = float(irow.get("cost") or 0)
+        distinct = int(irow.get("distinct_values") or 0)
+
+        st.markdown("---")
+        m1, m2, m3 = st.columns(3)
+        kpi_card(m1, "Workloads to tag", f"{n:,}", "neutral",
+                 f"confidence ≥ {min_conf:.2f}")
+        kpi_card(m2, "Spend now attributable", fmt_money(cost), "warn",
+                 "from AI suggestions")
+        kpi_card(m3, "Distinct values", f"{distinct}", "neutral", "the AI proposed")
+
+        if n == 0:
+            st.info("No suggestions meet this confidence cutoff. Lower the threshold, "
+                    "or (re)run the annotate job to refresh suggestions.")
+        else:
+            st.markdown(f"**What would be assigned to `{tag_key}`** (by suggested value)")
+            bd = db.run_query(queries.suggestions_bulk_breakdown(tag_key, min_conf, days, workspaces))
+            if not bd.empty:
+                disp = bd.copy()
+                disp["Cost"] = disp["cost"].map(fmt_money)
+                disp["Min conf"] = disp["min_conf"].map(lambda c: f"{float(c):.0%}")
+                st.dataframe(
+                    disp[["value", "workloads", "Cost", "Min conf"]],
+                    hide_index=True, use_container_width=True,
+                    column_config={"value": f"{tag_key} =", "workloads": "Workloads"})
+
+            st.markdown("---")
+            st.info("📬 Queuing writes one row per workload (in the warehouse) with the "
+                    "AI's suggested value. The writer job applies the batch — dry-run by "
+                    "default — and every change is auditable & reversible.")
+            if st.button(f"🤖 Queue {n:,} AI-suggested tags", type="primary"):
+                batch_id = tagging._new_batch_id()
+                sql = queries.enqueue_from_suggestions_sql(
+                    batch_id, tagging._requested_by(), tag_key, min_conf, days, workspaces)
+                inserted = db.run_exec(sql)
+                st.success(f"✅ Queued batch `{batch_id}` — {inserted:,} workloads, "
+                           f"{fmt_money(cost)} attributable once applied.")
+                st.caption("Open **Batches & Rollback** to run the writer and track status.")
+
 # ============================================================================= BATCHES
-with tab_batches:
+elif view == VIEWS[4]:  # Batches & Rollback
     st.subheader("Batches, status & rollback")
     st.caption("Every queued change lives in the write queue. The **writer job** applies "
                "batches (dry-run by default) and logs each change to the audit table, so a "
@@ -599,7 +671,7 @@ with tab_batches:
         )
 
 # ============================================================================= ABOUT
-with tab_about:
+elif view == VIEWS[5]:  # How it works
     st.markdown(
         """
 ### How this works
