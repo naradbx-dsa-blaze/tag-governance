@@ -106,7 +106,7 @@ surprises in front of a customer.
 | **Lakebase / Vector Search writes** | ⚠️ SDK-gated | Work on a current `databricks-sdk`; older runtimes return `UNSUPPORTED` (feature-detected, never crash). Confirm the job runtime SDK version. |
 | **Cross-workspace writes (M2)** | ⚠️ Code-verified, not live | M1 (home) fully proven. M2 needs an account SP assigned to workspaces with `CAN_MANAGE` (one-time admin step) — then it fans out. See "Cross-workspace writes (M2)". |
 | **Serverless SQL / Apps (~41% of spend)** | ℹ️ Reported, not tagged | Not per-resource taggable — attribute via **budget/tag policy**. The tool flags these as `UNSUPPORTED` with a reason (honest, not silent). |
-| **Advisory AI suggestions** | ✅ Proven | `ai_query` hint column; conservative (low-confidence `unknown` for cryptic workloads); never writes. |
+| **Advisory AI suggestions** | ✅ Proven | `ai_query` hint column + one-click "Bulk tag (AI)"; conservative (low-confidence `unknown` for cryptic workloads); never writes. Weekly job to limit inference cost; tunable/optional — see "Cost knob" below. |
 
 **Ship-ready today at the M1 tier + honest reporting.** Full-account M2 is one
 documented admin step (provision + entitle the account SP) away from live.
@@ -298,3 +298,22 @@ empty or unreadable, the jobs stay in M1. Do **not** store PATs in the app.
   command array — the command is wrapped in `sh -c` so the shell expands it.
 - Pair this backlog cleanup with **tag policies** so new workloads can't go untagged —
   the app clears the backlog, policy stops the bleeding.
+
+### Cost knob: AI-suggestion cadence
+
+The advisory `ai_query` classifier (`annotate.sql`) is the **only recurring inference
+cost** — it runs over the whole fleet (~50k workloads). It's deliberately a **separate
+weekly job** (`tag-governance-annotate`, Mondays 07:13 ET), *not* part of the daily
+summary refresh, because team→workload attribution barely changes day to day. The daily
+`tag-governance-refresh` is cheap SQL only.
+
+Tune it to the customer's appetite — it's a schedule, not a hardcode:
+
+| Want | Change |
+|------|--------|
+| **Cheaper** | Edit `tag-governance-annotate` cron to monthly (`0 13 7 1 * ?`), or pause the job and run it on demand (`databricks bundle run tag-governance-annotate`). |
+| **Fresher** | Bump the cron toward daily. |
+| **Cheapest** | Skip it entirely — the app degrades gracefully: the 🤖 hint column and "Bulk tag (AI)" view just show nothing, everything else (scan, rules-based bulk, writes, rollback) works unchanged. |
+
+Model choice is also a knob: `annotate_model` (bundle var) — a smaller/cheaper endpoint
+lowers per-row cost.
