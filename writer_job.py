@@ -279,14 +279,28 @@ def _persist(queue_table, audit_table, queue_updates, audit_rows, dry_run):
     the dict order is irrelevant; each row carries its own executed_by.
     """
     from pyspark.sql import functions as F
+    from pyspark.sql.types import StructType, StructField, StringType
+
+    # Explicit schemas: several columns (last_error, old_value, new_value, error)
+    # are None on an all-success or all-remove batch, and Spark's createDataFrame
+    # can't infer a type from an all-null column (CANNOT_DETERMINE_TYPE) — which
+    # would crash AFTER the tag was already written, leaving the queue PENDING.
+    def _schema(cols):
+        return StructType([StructField(c, StringType(), True) for c in cols])
 
     if audit_rows:
-        adf = spark.createDataFrame(audit_rows).withColumn(
-            "executed_at", F.current_timestamp())
+        audit_cols = ["audit_id", "batch_id", "executed_by", "workspace_id", "product",
+                      "workload_id", "tag_key", "old_value", "new_value", "action",
+                      "status", "error"]
+        adf = spark.createDataFrame(
+            [{c: r.get(c) for c in audit_cols} for r in audit_rows], _schema(audit_cols)
+        ).withColumn("executed_at", F.current_timestamp())
         adf.write.mode("append").saveAsTable(audit_table)
 
     if queue_updates:
-        udf = spark.createDataFrame(queue_updates)
+        upd_cols = ["batch_id", "workload_id", "product", "tag_key", "status", "last_error"]
+        udf = spark.createDataFrame(
+            [{c: u.get(c) for c in upd_cols} for u in queue_updates], _schema(upd_cols))
         udf.createOrReplaceTempView("_tg_updates")
         # Match on the full natural key including product: workload_id is a
         # coalesce over id namespaces, so the same id string can appear under two
