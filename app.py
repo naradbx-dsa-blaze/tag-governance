@@ -71,6 +71,32 @@ def fmt_money(v) -> str:
     return f"${v:,.0f}"
 
 
+def show_run_writer_next(batch_id: str):
+    """After an enqueue, spell out the REQUIRED next step. The app only queues —
+    a batch sits PENDING until the writer job is run. Make that impossible to miss."""
+    st.warning(
+        "⏸️ **Queued — not applied yet.** The app only *queues* changes; this batch "
+        "stays **PENDING** until you run the **writer job**. Nothing is tagged until then.",
+        icon="⏸️",
+    )
+    with st.expander("▶️ How to apply this batch (run the writer)", expanded=True):
+        st.markdown("Run these from a terminal, safest first — or use the Jobs UI "
+                    "(**tag-governance-writer → Run now** with the same parameters):")
+        st.code(
+            f"# 1. Smoke test — proves reachability, writes nothing\n"
+            f"databricks bundle run tag-governance-writer -- \\\n"
+            f"  --python-params smoke_test=true batch_id={batch_id}\n\n"
+            f"# 2. Dry run — logs intended old→new, still writes nothing\n"
+            f"databricks bundle run tag-governance-writer -- \\\n"
+            f"  --python-params dry_run=true batch_id={batch_id}\n\n"
+            f"# 3. Apply for real (home workspace in M1)\n"
+            f"databricks bundle run tag-governance-writer -- \\\n"
+            f"  --python-params dry_run=false batch_id={batch_id}",
+            language="bash",
+        )
+        st.caption("Track status any time in the **📬 Batches & Rollback** view.")
+
+
 # ----------------------------------------------------------------------------- sidebar
 st.sidebar.title("🏷️ Tag Governance")
 st.sidebar.caption("Find untagged spend. Attribute it to teams.")
@@ -321,8 +347,9 @@ elif view == VIEWS[1]:  # Tag & Verify
 
         st.markdown("#### Assign chargeback tags")
         if already:
-            st.success(f"✅ **Queued** — tags { already['tags'] } "
-                       f"(batch `{already.get('batch_id','?')}`). Run the writer job to apply.")
+            st.success(f"✅ **Queued** — tags { already['tags'] } (batch `{already.get('batch_id','?')}`).")
+            if already.get("batch_id"):
+                show_run_writer_next(already["batch_id"])
 
         if not tag_keys:
             st.warning("Choose your chargeback keys in the sidebar first.")
@@ -526,7 +553,7 @@ elif view == VIEWS[2]:  # Bulk tag (rules)
                     rows = rows if rows is not None else matched_cnt  # driver may not report rowcount
                     st.success(f"✅ Queued batch `{res['batch_id']}` — {rows:,} "
                                f"queue rows, {fmt_money(matched_cost)} now attributable once applied.")
-                    st.caption("Open the **Batches & Rollback** tab to run the writer and track status.")
+                    show_run_writer_next(res["batch_id"])
                 else:
                     st.warning(res.get("message", "Nothing to queue."))
 
@@ -591,7 +618,7 @@ elif view == VIEWS[3]:  # Bulk tag (AI)
                 shown = inserted if inserted is not None and inserted >= 0 else n
                 st.success(f"✅ Queued batch `{batch_id}` — {shown:,} workloads, "
                            f"{fmt_money(cost)} attributable once applied.")
-                st.caption("Open **Batches & Rollback** to run the writer and track status.")
+                show_run_writer_next(batch_id)
 
 # ============================================================================= BATCHES
 elif view == VIEWS[4]:  # Batches & Rollback
@@ -599,6 +626,10 @@ elif view == VIEWS[4]:  # Batches & Rollback
     st.caption("Every queued change lives in the write queue. The **writer job** applies "
                "batches (dry-run by default) and logs each change to the audit table, so a "
                "whole batch can be rolled back exactly.")
+    st.info("**PENDING = queued, not yet applied.** The app only queues tag changes; "
+            "run the **tag-governance-writer** job to apply a batch (see the command "
+            "under any batch below). Statuses: PENDING → SUCCEEDED / FAILED / "
+            "UNSUPPORTED (policy-governed, e.g. serverless SQL & Apps) / SKIPPED_DRYRUN.")
 
     try:
         batches = db.run_query(queries.recent_batches())
