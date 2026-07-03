@@ -98,6 +98,9 @@ resources:
         # enable M2 cross-workspace writes. Passed as a scope NAME, not the secrets.
         - name: account_sp_scope
           default: ${var.account_sp_scope}
+        # smoke_test=true → reachability check only (no writes). For validating M2.
+        - name: smoke_test
+          default: "false"
       tasks:
         - task_key: drain_queue
           spark_python_task:
@@ -110,6 +113,7 @@ resources:
               - dry_run={{job.parameters.dry_run}}
               - workspace_id={{job.parameters.workspace_id}}
               - batch_id={{job.parameters.batch_id}}
+              - smoke_test={{job.parameters.smoke_test}}
               - max_workers={{job.parameters.max_workers}}
               - account_sp_scope={{job.parameters.account_sp_scope}}
           environment_key: default

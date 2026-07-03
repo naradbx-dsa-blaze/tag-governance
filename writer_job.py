@@ -112,6 +112,10 @@ def run():
     only_workspace = _param("workspace_id") or None
     only_batch = _param("batch_id") or None
     max_workers = int(_param("max_workers", "4") or "4")
+    # smoke_test=true: prove the account SP can REACH each workspace with PENDING
+    # rows (resolve a client + a cheap read), writing/enqueuing NOTHING. Lets an
+    # admin validate M2 setup before any real batch. Implies no mutation.
+    smoke_test = (_param("smoke_test", "false") or "false").lower() == "true"
 
     if not queue_table or not audit_table:
         raise SystemExit("queue_table and audit_table parameters are required")
@@ -177,6 +181,27 @@ def run():
 
     if not pending:
         print("No PENDING rows to process.")
+        return
+
+    # SMOKE TEST: prove reachability per workspace, mutate nothing. For each
+    # distinct workspace with PENDING rows, try to resolve a client and do a cheap
+    # read (current_user). Reports REACHABLE / UNREACHABLE per workspace so an
+    # admin can confirm the account SP is entitled everywhere before a real run.
+    if smoke_test:
+        distinct_ws = sorted({str(r["workspace_id"]) for r in pending})
+        print(f"SMOKE TEST — checking {len(distinct_ws)} workspace(s), no writes. "
+              f"mode={'M2 (account SP)' if resolver.cross_workspace else 'M1 (home only)'}")
+        ok = 0
+        for wid in distinct_ws:
+            try:
+                cl = resolver.client_for(wid)
+                who = cl.current_user.me().user_name  # cheap read proves the token works
+                print(f"  ✓ REACHABLE  workspace {wid} as {who}")
+                ok += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"  ✗ UNREACHABLE workspace {wid}: {e}")
+        print(f"SMOKE TEST done: {ok}/{len(distinct_ws)} workspace(s) reachable. "
+              f"Nothing was written.")
         return
 
     print(f"Draining {len(pending)} rows | dry_run={dry_run} | "

@@ -83,6 +83,7 @@ WRITE PATH (app never mutates a resource):
 | `writer.py` | Per-product live tag writes (GET→MERGE→PUT, idempotent, best-effort) |
 | `writer_job.py` | Drains the queue cost-descending, per-workspace + 429 backoff, writes audit |
 | `ws_clients.py` | Resolves workspace_id → WorkspaceClient (M1 home-only / M2 account-SP); shared by both jobs |
+| `setup_m2.sh` | Account-admin script: provision the account SP + secret scope, then smoke-test M2 reachability |
 | `rollback_job.py` | Undoes a batch by replaying the audit in reverse |
 | `app.yaml` | Apps runtime config |
 | `databricks.yml` | DAB bundle (app + refresh/writer/rollback jobs) with `*_table` variables |
@@ -104,7 +105,7 @@ surprises in front of a customer.
 | **Portable to any account** | ✅ By design | No account-specific values in code — only bundle-var defaults. Change `warehouse_id` + table vars; touch zero code. |
 | **Tag writes: Jobs / clusters / warehouses / serving** | ✅ Proven (M1) | Live-verified in the home workspace. ~59% of untagged cost. |
 | **Lakebase / Vector Search writes** | ⚠️ SDK-gated | Work on a current `databricks-sdk`; older runtimes return `UNSUPPORTED` (feature-detected, never crash). Confirm the job runtime SDK version. |
-| **Cross-workspace writes (M2)** | ⚠️ Code-verified, not live | M1 (home) fully proven. M2 needs an account SP assigned to workspaces with `CAN_MANAGE` (one-time admin step) — then it fans out. See "Cross-workspace writes (M2)". |
+| **Cross-workspace writes (M2)** | ⚠️ Code-verified + scripted setup + smoke test | M1 (home) fully proven. M2 is code-complete, thread-safe, and fails loud on misconfig; it needs a one-time account-SP setup (`setup_m2.sh`) which the admin validates with a no-write smoke test (`smoke_test=true`). Not yet run against a live foreign workspace by us. See "Cross-workspace writes (M2)". |
 | **Serverless SQL / Apps (~41% of spend)** | ℹ️ Reported, not tagged | Not per-resource taggable — attribute via **budget/tag policy**. The tool flags these as `UNSUPPORTED` with a reason (honest, not silent). |
 | **Advisory AI suggestions** | ✅ Proven | `ai_query` hint column + one-click "Bulk tag (AI)"; conservative (low-confidence `unknown` for cryptic workloads); never writes. Weekly job to limit inference cost; tunable/optional — see "Cost knob" below. |
 
@@ -256,7 +257,24 @@ chosen by whether account-SP creds are available (`ws_clients.ClientResolver`):
   writer resolves a per-workspace `WorkspaceClient` for every workspace via
   `AccountClient.get_workspace_client(...)` and can drain **all** workspaces at once.
 
-**Enable M2 (one-time):**
+**Fastest path — run the setup script.** `setup_m2.sh` does all of the below as an
+account admin (create SP → OAuth secret → assign to workspaces → store secret scope)
+and ends with a **smoke test** that proves the SP can reach every workspace *without
+tagging anything*. Edit the vars at the top, then:
+```bash
+./setup_m2.sh
+```
+
+**Validate before any real run — smoke test (writes nothing):**
+```bash
+databricks bundle run tag-governance-writer -- --python-params smoke_test=true
+```
+It prints `✓ REACHABLE workspace <id>` for each workspace that has queued rows, or
+`✗ UNREACHABLE` (with the reason) if the SP isn't assigned there yet. This is the
+one-command answer to "is M2 wired up correctly?" — run it until every workspace is
+reachable, *then* do a real batch.
+
+**Enable M2 manually (what the script automates):**
 1. **Create an account-level service principal** (Account Console → User management →
    Service principals) and generate an **OAuth secret** (client ID + secret) for it.
 2. **Assign it to each target workspace** (Account Console → Workspaces → *Permissions*),
