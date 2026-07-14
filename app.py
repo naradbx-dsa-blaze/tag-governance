@@ -535,19 +535,22 @@ async function doRulePreview(){
             `<button class=ghost style="margin:0;padding:4px 10px" `+
             `onclick="ruleToggleAll(false)">Uncheck all</button> `+
             `<span id=ruleSel class=note></span></div>`;
+    html += `<div class=note style="margin:4px 0">${$("#tagKey").value} value — `+
+            `edit any row inline (e.g. change a few from data-eng to data-sci):</div>`;
     html += "<div style='max-height:340px;overflow:auto'><table>"+
             "<tr><th></th><th>Workload</th><th>Product</th><th>Owner</th>"+
-            "<th class=num>Cost</th><th>Will be tagged</th></tr>";
+            "<th class=num>Cost</th><th>Set value</th></tr>";
     wl.forEach((w, idx) => {
       html += `<tr><td><input type=checkbox class=rwsel data-i="${idx}" checked onchange="ruleSelCount()"></td>`+
               `<td>${w.workload_name||'—'}</td><td>${w.product}</td>`+
               `<td class=muted>${w.owner||'—'}</td><td class=num>${money(w.cost)}</td>`+
-              `<td><span class=pill>${$("#tagKey").value} = ${w.new_tag_value}</span></td></tr>`;
+              `<td><input class=rwval data-i="${idx}" value="${w.new_tag_value||''}" `+
+              `style="width:140px;padding:5px 8px"></td></tr>`;
     });
     html += "</table></div>";
     if(wl.length < (i.matched_count||0))
       html += `<div class=note>Showing top ${wl.length} by cost of ${i.matched_count}. `+
-              `(Only the workloads shown here can be individually unchecked.)</div>`;
+              `(Only the workloads shown here can be individually unchecked/edited.)</div>`;
   }
   $("#rulePreviewBox").innerHTML = html;
   ruleSelCount();
@@ -565,10 +568,15 @@ function ruleSelCount(){
 function selectedRuleWorkloads(){
   const out = [];
   for(const c of document.querySelectorAll(".rwsel:checked")){
-    const w = _ruleWorkloads[+c.dataset.i];
-    if(w) out.push({workload_id:w.workload_id, product:w.product,
+    const i = +c.dataset.i, w = _ruleWorkloads[i];
+    if(!w) continue;
+    // Use the row's (possibly edited) value, not the rule's default.
+    const valEl = document.querySelector(`.rwval[data-i="${i}"]`);
+    const val = (valEl ? valEl.value : w.new_tag_value || "").trim();
+    if(!val) continue;   // blank value = skip this row
+    out.push({workload_id:w.workload_id, product:w.product,
       workspace_id:w.workspace_id, workload_name:w.workload_name,
-      is_serverless:w.is_serverless, tag_value:w.new_tag_value, cost:w.cost});
+      is_serverless:w.is_serverless, tag_value:val, cost:w.cost});
   }
   return out;
 }
