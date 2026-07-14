@@ -529,7 +529,11 @@ matched AS (
 {ladder}
            ELSE -1 END AS first_rule
   FROM wl
+  -- Only enqueue workloads the writer can actually per-resource tag. Without
+  -- this, a rule matching e.g. an APPS workload would enqueue a row that sits
+  -- PENDING forever (the writer can't tag Apps — they're budget-policy governed).
   WHERE is_untagged AND cost > 0
+    AND {_taggable_predicate('product', 'is_serverless')}
 ),
 ruletags(rule_idx, tag_key, tag_value) AS (
   VALUES
