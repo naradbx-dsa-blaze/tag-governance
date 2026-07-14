@@ -23,7 +23,10 @@
 CREATE OR REPLACE TABLE IDENTIFIER(:suggestions_table) AS
 WITH wl AS (
   -- One row per workload (collapse the daily rows), keeping the signals the
-  -- classifier reasons over. Only untagged-relevant workloads with real cost.
+  -- classifier reasons over. Only workloads with real cost that are STILL
+  -- UNTAGGED for cost_center — there's no point spending inference on workloads
+  -- already tagged (the app filters them out of the preview anyway). As a fleet
+  -- gets tagged, this shrinks the annotate pass and its cost over time.
   SELECT
     product,
     workload_id,
@@ -35,6 +38,8 @@ WITH wl AS (
   WHERE usage_date >= current_date() - INTERVAL 30 DAYS
   GROUP BY product, workload_id
   HAVING SUM(list_cost) > 0
+    AND NOT arrays_overlap(
+      array_distinct(flatten(collect_list(tag_keys))), array('cost_center'))
 ),
 scored AS (
   SELECT

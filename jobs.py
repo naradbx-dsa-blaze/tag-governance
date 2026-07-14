@@ -31,33 +31,48 @@ def _job_id(name: str) -> int:
     raise RuntimeError(f"Job '{name}' not found — deploy the bundle first.")
 
 
-def _run_url(run_id: int) -> str:
+def _host() -> str:
     host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
     if not host:
         try:
             host = _client().config.host.rstrip("/")
         except Exception:
             host = ""
-    return f"{host}/jobs/runs/{run_id}" if host else str(run_id)
+    # Guarantee a scheme — without https:// the browser treats the URL as a
+    # relative path and the run link 404s. config.host / the env var sometimes
+    # arrive bare (host only).
+    if host and not host.startswith("http"):
+        host = "https://" + host
+    return host
+
+
+def _run_url(job_id: int, run_id: int) -> str:
+    """A run URL that actually resolves. Databricks run pages are keyed by BOTH
+    job_id and run_id — /jobs/runs/{run_id} alone 404s. Use the canonical
+    /jobs/{job_id}/runs/{run_id} form."""
+    host = _host()
+    return f"{host}/jobs/{job_id}/runs/{run_id}" if host else str(run_id)
 
 
 def run_writer(batch_id: str, dry_run: bool = True) -> dict:
     """Kick off the writer job for one batch. Non-blocking — returns immediately."""
     w = _client()
+    job_id = _job_id(WRITER_JOB)
     run = w.jobs.run_now(
-        job_id=_job_id(WRITER_JOB),
+        job_id=job_id,
         job_parameters={"batch_id": batch_id, "dry_run": "true" if dry_run else "false"},
     )
-    return {"run_id": run.run_id, "url": _run_url(run.run_id),
+    return {"run_id": run.run_id, "url": _run_url(job_id, run.run_id),
             "dry_run": dry_run, "batch_id": batch_id}
 
 
 def run_rollback(batch_id: str, dry_run: bool = True) -> dict:
     """Kick off the rollback job for one batch. Non-blocking."""
     w = _client()
+    job_id = _job_id(ROLLBACK_JOB)
     run = w.jobs.run_now(
-        job_id=_job_id(ROLLBACK_JOB),
+        job_id=job_id,
         job_parameters={"batch_id": batch_id, "dry_run": "true" if dry_run else "false"},
     )
-    return {"run_id": run.run_id, "url": _run_url(run.run_id),
+    return {"run_id": run.run_id, "url": _run_url(job_id, run.run_id),
             "dry_run": dry_run, "batch_id": batch_id}

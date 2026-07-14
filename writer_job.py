@@ -166,6 +166,9 @@ def run():
     def _q(v: str) -> str:  # escape single quotes for inline SQL
         return v.replace("'", "''")
 
+    def _sql_lit(v: str) -> str:  # quoted SQL string literal
+        return "'" + _q(v) + "'"
+
     where = ["status = 'PENDING'"]
     if only_workspace:
         where.append(f"workspace_id = '{_q(only_workspace)}'")
@@ -173,11 +176,49 @@ def run():
         where.append(f"batch_id = '{_q(only_batch)}'")
     where_sql = " AND ".join(where)
 
-    # Cost-descending drain: largest spend attributed first.
-    pending = spark.sql(
-        f"SELECT * FROM {queue_table} WHERE {where_sql} "
-        f"ORDER BY list_cost DESC NULLS LAST"
-    ).collect()
+    # ATOMIC CLAIM: flip the rows we intend to drain from PENDING → RUNNING, stamped
+    # with a token unique to THIS run, in a single MERGE/UPDATE. Then we only process
+    # rows carrying our token. Two writer runs overlapping on the same batch each
+    # claim a DISJOINT set (a row can only transition out of PENDING once), so
+    # neither double-tags nor double-drains. Smoke test skips claiming (reads only).
+    if not smoke_test:
+        # Reclaim STALE RUNNING rows first: if an earlier run crashed mid-drain, its
+        # rows are stuck RUNNING. Anything RUNNING for >30 min is presumed dead and
+        # eligible to be re-claimed (idempotent writer makes re-processing safe).
+        reclaim = where_sql.replace(
+            "status = 'PENDING'",
+            "(status = 'PENDING' OR (status = 'RUNNING' AND "
+            "executed_at < current_timestamp() - INTERVAL 30 MINUTES))")
+        run_token = f"run-{uuid.uuid4().hex[:16]}"
+
+        def _claim():
+            spark.sql(
+                f"UPDATE {queue_table} SET status='RUNNING', last_error={_sql_lit(run_token)}, "
+                f"executed_at=current_timestamp() WHERE {reclaim}")
+            return spark.sql(
+                f"SELECT * FROM {queue_table} WHERE status='RUNNING' "
+                f"AND last_error={_sql_lit(run_token)} ORDER BY list_cost DESC NULLS LAST"
+            ).collect()
+
+        pending = _claim()
+        # RACE GUARD: when the app triggers this job right after enqueuing a specific
+        # batch, the INSERT may not yet be visible to this Spark session, so the
+        # first claim finds nothing. Rather than falsely report "nothing to do" and
+        # leave the batch stuck PENDING, retry a few times for an EXPLICIT batch_id.
+        # (No retry for a full/scheduled drain — there, empty genuinely means empty.)
+        if not pending and only_batch:
+            for attempt in range(1, 6):  # ~ up to ~30s
+                print(f"batch {only_batch}: 0 rows claimed yet, retrying "
+                      f"({attempt}/5) in case the enqueue isn't visible…")
+                time.sleep(5)
+                pending = _claim()
+                if pending:
+                    break
+    else:
+        pending = spark.sql(
+            f"SELECT * FROM {queue_table} WHERE {where_sql} "
+            f"ORDER BY list_cost DESC NULLS LAST"
+        ).collect()
 
     if not pending:
         print("No PENDING rows to process.")

@@ -1,32 +1,37 @@
-# Tag Governance — Untagged Consumption Scanner
+# Tag Governance — Chargeback Tagging for Databricks
 
-A Databricks App that scans consumption across **every billing product and every
-workspace in an account**, finds the workloads that aren't tagged for chargeback,
-ranks them by cost, and lets you apply your own tag keys in place — with a safe
-**dry-run preview → approve** flow before anything is mutated.
+A **Databricks App (FastAPI)** + supporting jobs that finds workloads not tagged
+for chargeback across **every billing product and every workspace in an account**,
+ranks them by cost, and applies your chargeback tags — three ways: **AI-suggested**,
+**deterministic rules**, or **one workload at a time**. Every write goes through a
+queue → writer job → audit trail and is **reversible**.
 
-> Built for the chargeback problem: consumption is high, but workloads were never
-> tagged, so cost can't be attributed back to teams. Account-wide and
-> customer-portable — deploy it into any Databricks account in minutes.
-
-**Live demo (e2-demo-field-eng):** https://tag-governance-1444828305810485.aws.databricksapps.com
+> The chargeback problem: consumption is high, but workloads were never tagged, so
+> cost can't be attributed back to teams. Account-wide, and **portable — deploy the
+> same bundle into any workspace by adding a target** (see below).
 
 ---
 
-## What it does
+## What it does ✅ / does NOT do ❌
 
-| Step | Detail |
-|------|--------|
-| **Scan** | Reads `system.billing.usage` (last *N* days), joins current list prices, flags every workload **missing your chargeback keys**. |
-| **Rank** | Groups usage by resource id (`job_id`, `warehouse_id`, `endpoint_id`, `dlt_pipeline_id`, …) and sorts by untagged cost — fix the expensive gaps first. |
-| **Per workspace** | `system.billing.usage` is **account-wide**, so the app sees every workspace with no extra login. Filter to one/all, and see which workspaces carry the most unattributable spend. |
-| **Suggest owner** | Pulls `identity_metadata` so even untagged workloads come with a likely owner — a one-click starting value. |
-| **Tag in place** | Pick your own keys, **① Preview** the exact per-resource API call, **② Approve & apply**. Approvals collect in a session queue with a running "spend now attributable" total. |
-| **Bulk tag (rules)** | For 1000s of workloads: define a few **rules** (`owner equals X → team=Y`, `name matches fraud-* → team=risk`). Each rule attributes every match at once; earlier rules win on conflict. Preview match count, cost coverage, per-rule breakdown, a sample, and conflicts before applying. |
-| **Verify** | Tag lands on the resource immediately; billing attribution follows on future usage (system tables lag ~hours). |
+**Does:**
+- **Finds** untagged spend from `system.billing.usage` (account-wide, all workspaces), ranked by cost.
+- **Tags three ways:** 🤖 AI suggestions (an `ai_query` pass proposes a cost-center per workload, confidence-scored), 📋 rules (`owner contains X → team=Y`, evaluated in-warehouse so it scales to 50k+ workloads), ✏️ manual (one workload, typed value).
+- **Writes safely:** the app only enqueues *intent*; a **writer job** does the actual per-resource tag writes, cost-descending, with 429 backoff, and records every `old→new` change to an audit table.
+- **Rolls back:** a rollback job replays the audit in reverse to restore pre-batch tag values.
+- **Merges, never clobbers:** setting `cost_center` preserves a resource's existing tags and all its other settings (jobs use a partial `jobs.update`).
+- **Is honest about coverage:** a "Tagged a different way" panel shows spend that can't take a per-resource tag and the correct action for each.
 
-**Dry-run by default** — approving *records* the decision without mutating. Live
-writes are a deliberate, separate switch (see below).
+**Does NOT:**
+- ❌ **Tag resources the writer's identity can't manage.** Writes only succeed on resources the running identity has `CAN_MANAGE` on. A regular user gets `PermissionDenied` on others' jobs (recorded as FAILED, nothing mutated). **Make the app/writer service principal a workspace admin** to tag across the workspace. (See "Who the WRITER runs as".)
+- ❌ **Tag serverless resources per-resource.** Databricks Apps, serverless SQL, model serving, serverless jobs, pipelines, Lakebase are attributed via a **budget policy** (UI, or the `databricks_budget_policy` Terraform resource) — not a `custom_tags` write. The app surfaces these but does not create budget policies.
+- ❌ **Tag DLT/SDP via a standalone call** — those tags live in the pipeline definition (`clusters[].custom_tags`).
+- ❌ **Write across workspaces by default** (M1 = home workspace only). Cross-workspace live writes need an account service principal (M2 — see below).
+- ❌ **Instantly attribute cost.** The tag lands on the resource immediately; billing attribution appears on *future* usage and system tables lag a few hours.
+
+**Applies for real by default.** Each apply has a **"Dry run only"** checkbox (off by
+default) and a confirm prompt before a live write. Dry run computes `old→new` and
+writes nothing.
 
 ---
 
@@ -35,7 +40,7 @@ writes are a deliberate, separate switch (see below).
 ```
 system.billing.usage  ──┐
 (account-wide, all WS)   │   materialize.sql (daily job)
-system.billing.list_prices ─► tag_governance_workload_daily  ──► Streamlit app
+system.billing.list_prices ─► tag_governance_workload_daily  ──► FastAPI app
 system.access.workspaces_latest                (pre-aggregated)      (sub-second reads)
                                      annotate.sql (ai_query) ──► tag_governance_suggestions
                                                                    (advisory hints)
@@ -73,8 +78,9 @@ WRITE PATH (app never mutates a resource):
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Streamlit UI — Scan / Tag & Verify / Bulk / Batches & Rollback / How-it-works |
-| `db.py` | Cached SQL connection + `run_query` (read) + `run_exec` (enqueue write) |
+| `app.py` | FastAPI app — single HTML page: overview + 3 tag modes (AI / Rules / Manual) + Batches & rollback + "tagged a different way" panel; serves `/api/*` |
+| `jobs.py` | Triggers the writer/rollback jobs via the SDK (`run_now`), resolves them by name, builds the run URL |
+| `db.py` | Shared SQL connection + `run_query` (read, returns dict rows) + `run_exec` (enqueue write) |
 | `queries.py` | SQL builders — reads/enqueue/status/suggestions; reads `TAG_GOVERNANCE_*_TABLE` |
 | `materialize.sql` | Builds the summary table — `CREATE TABLE IDENTIFIER(:summary_table)` |
 | `schema.sql` | Creates the write-queue + audit tables (`IF NOT EXISTS`) |
@@ -87,7 +93,7 @@ WRITE PATH (app never mutates a resource):
 | `rollback_job.py` | Undoes a batch by replaying the audit in reverse |
 | `app.yaml` | Apps runtime config |
 | `databricks.yml` | DAB bundle (app + refresh/writer/rollback jobs) with `*_table` variables |
-| `requirements.txt` | streamlit, databricks-sql-connector, databricks-sdk, pandas |
+| `requirements.txt` | fastapi, uvicorn[standard], databricks-sql-connector, databricks-sdk |
 
 ---
 
@@ -180,6 +186,42 @@ app shows a "data as of <date>" stamp so users know the freshness.
 That's it — the workspace list, billing data, and friendly names all populate
 automatically from their account.
 
+### Worked example: this bundle deployed to two clouds
+
+The same bundle, zero code changes, runs in two independent workspaces — proof the
+target mechanism is all that differs:
+
+| Target | Cloud / host | Catalog for its tables |
+|--------|--------------|------------------------|
+| `dev` (default) | AWS `e2-demo-field-eng` | `users.narasimha_kamathardi.*` |
+| `fe-east` | Azure `adb-984752964297111.11.azuredatabricks.net` | `main.tag_governance.*` |
+
+Each deployment owns its **own** summary/queue/audit tables in its **own** catalog
+and never reads the other's data. To add a third workspace, copy a target block,
+set its 5 vars (`host`, `warehouse_id`, `summary_table`, `queue_table`,
+`audit_table`), and `deploy -t <name>`. Nothing in the Python names a workspace.
+
+### ⚠️ Who the WRITER runs as determines what can be tagged
+
+Enqueuing and reading are fine for any user. **Applying** tags is only as powerful
+as the identity the writer job runs as:
+
+- The writer can only tag resources that identity has **CAN_MANAGE** on. A regular
+  user tagging jobs they don't own gets `PermissionDenied` (correctly recorded as
+  FAILED, nothing mutated).
+- A **workspace admin** (or an admin service principal) has implicit CAN_MANAGE on
+  all jobs / serving endpoints in the workspace → those writes succeed. *(Verified
+  on `fe-east`: as admin, live-tagged 3 jobs owned by 3 other users — tags landed,
+  their tasks/schedules/existing tags untouched.)*
+- Some products can **never** take a per-resource tag regardless of role — Apps,
+  serverless SQL, AI Gateway (policy-governed) and Vector Search on older SDKs.
+  These are reported UNSUPPORTED, not failed.
+- Admin rights are **per-workspace**. Account-wide writing across many workspaces
+  needs the account-SP setup (see "Cross-workspace writes (M2)").
+
+So for a customer: deploy per workspace, and make the **app/writer service
+principal a workspace admin** in each workspace where they want live tagging.
+
 ---
 
 ## Running locally (dev)
@@ -187,8 +229,11 @@ automatically from their account.
 export DATABRICKS_CONFIG_PROFILE=customer
 export DATABRICKS_WAREHOUSE_ID=<their-warehouse-id>
 export TAG_GOVERNANCE_SUMMARY_TABLE=<their_catalog>.<their_schema>.tag_governance_workload_daily
+export TAG_GOVERNANCE_QUEUE_TABLE=<their_catalog>.<their_schema>.tag_governance_write_queue
+export TAG_GOVERNANCE_AUDIT_TABLE=<their_catalog>.<their_schema>.tag_governance_audit
+export TAG_GOVERNANCE_SUGGESTIONS_TABLE=<their_catalog>.<their_schema>.tag_governance_suggestions
 pip install -r requirements.txt
-streamlit run app.py
+uvicorn app:app --reload --port 8000   # open http://localhost:8000
 ```
 
 ---
@@ -209,15 +254,15 @@ databricks sql query --warehouse <id> --file schema.sql \
   --param audit_table=<cat.sch.tag_governance_audit>
 ```
 
-### Apply a batch (dry-run first — always)
+### Apply a batch from the CLI (the app does this for you via a button)
+These jobs use **job-level parameters**, so pass them with `--params key=value,…`
+(comma-separated) — NOT `--python-params`.
 ```bash
 # 1. Dry-run: writes NOTHING, logs the intended old→new for inspection
-databricks bundle run tag-governance-writer -- \
-  --python-params dry_run=true batch_id=<BATCH_ID>
+databricks bundle run tag-governance-writer --params dry_run=true,batch_id=<BATCH_ID>
 
 # 2. Live (M1 = home workspace only): performs the real per-product writes
-databricks bundle run tag-governance-writer -- \
-  --python-params dry_run=false batch_id=<BATCH_ID> workspace_id=<HOME_WS_ID>
+databricks bundle run tag-governance-writer --params dry_run=false,batch_id=<BATCH_ID>
 ```
 The writer drains **cost-descending** (largest spend first), runs **per-workspace in
 parallel** with exponential backoff on HTTP 429, is **idempotent** (a tag already at
@@ -226,8 +271,7 @@ table. Re-running after a crash simply drains the remaining `PENDING` rows.
 
 ### Roll a batch back
 ```bash
-databricks bundle run tag-governance-rollback -- \
-  --python-params dry_run=false batch_id=<BATCH_ID>
+databricks bundle run tag-governance-rollback --params dry_run=false,batch_id=<BATCH_ID>
 ```
 Restores every tag to its pre-batch value from the audit log (removes the key if it
 didn't exist before), writing `ROLLBACK` audit rows.
@@ -267,7 +311,7 @@ tagging anything*. Edit the vars at the top, then:
 
 **Validate before any real run — smoke test (writes nothing):**
 ```bash
-databricks bundle run tag-governance-writer -- --python-params smoke_test=true
+databricks bundle run tag-governance-writer --params smoke_test=true
 ```
 It prints `✓ REACHABLE workspace <id>` for each workspace that has queued rows, or
 `✗ UNREACHABLE` (with the reason) if the SP isn't assigned there yet. This is the
@@ -293,7 +337,7 @@ reachable, *then* do a real batch.
    ```bash
    databricks bundle deploy --var account_sp_scope=tag_governance_acct_sp
    # then drain ALL workspaces (omit workspace_id):
-   databricks bundle run tag-governance-writer -- --python-params dry_run=false
+   databricks bundle run tag-governance-writer --params dry_run=false
    ```
 
 The scope **name** is passed as a job parameter; the secrets themselves are read at
@@ -312,8 +356,9 @@ empty or unreadable, the jobs stay in M1. Do **not** store PATs in the app.
   `RemoveAfter`) — not governance tags.
 - **Serverless** products (serverless SQL, Apps) attribute cost via **budget/tag
   policies**, not free-form `custom_tags`. The app flags these per workload.
-- **Streamlit on Apps:** `${DATABRICKS_APP_PORT}` is not expanded inside an app.yaml
-  command array — the command is wrapped in `sh -c` so the shell expands it.
+- **App port on Databricks Apps:** `${DATABRICKS_APP_PORT}` is not expanded inside an
+  `app.yaml` command array, so the command is wrapped in `sh -c "uvicorn app:app
+  --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"` for the shell to expand it.
 - Pair this backlog cleanup with **tag policies** so new workloads can't go untagged —
   the app clears the backlog, policy stops the bleeding.
 

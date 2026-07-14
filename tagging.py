@@ -339,34 +339,58 @@ def enqueue_from_suggestions(batch_id: str, tag_key: str, min_confidence: float,
 
 
 def auto_tag(tag_key: str, days: int, rules: list | None = None,
-             min_confidence: float = 0.8, workspaces=None) -> dict:
+             min_confidence: float = 0.8, workspaces=None,
+             use_ai: bool = True) -> dict:
     """The seamless one-shot: rules first, AI suggestions for the rest, ONE batch.
 
     Everything enqueues under a single batch_id so it drains and rolls back as a
     unit. Does NOT run the writer — the caller triggers the writer job (dry-run by
     default) so the safety switch stays next to the code that mutates resources.
+
+    use_ai=False makes this a PURE RULES run — the AI-suggestion step is skipped
+    entirely, for customers who don't want AI-proposed tags. With no rules and
+    use_ai=False, nothing is enqueued (total_rows=0).
     """
     import db
     import queries
     batch_id = _new_batch_id()
     rules = rules or []
 
-    rule_rows = 0
+    # Run the rule INSERT (if any). We DON'T trust run_exec's return: the
+    # Databricks SQL connector reports -1 for DML rowcounts, so we count the
+    # actual queued rows below instead of inferring from rowcount.
+    rule_done = False
     if rules:
         rsql = queries.enqueue_bulk_sql(
             batch_id=batch_id, requested_by=_requested_by(), days=days,
             tag_keys=[tag_key], rules=rules, workspaces=workspaces,
         )
         if rsql is not None:
-            inserted = db.run_exec(rsql)
-            rule_rows = inserted if (inserted is not None and inserted >= 0) else 0
+            db.run_exec(rsql)
+            rule_done = True
+
+    rows_after_rules = _count_batch(batch_id) if rule_done else 0
 
     # AI fallback: only workloads a rule didn't already cover in this batch.
-    ai_rows = enqueue_from_suggestions(
-        batch_id=batch_id, tag_key=tag_key, min_confidence=min_confidence,
-        days=days, workspaces=workspaces, exclude_batch_id=batch_id,
-    ) or 0
+    # Skipped entirely when the customer opts out of AI.
+    if use_ai:
+        ai_sql = queries.enqueue_from_suggestions_sql(
+            batch_id=batch_id, requested_by=_requested_by(), tag_key=tag_key,
+            min_confidence=min_confidence, days=days, workspaces=workspaces,
+            exclude_batch_id=batch_id,
+        )
+        db.run_exec(ai_sql)
 
+    total_rows = _count_batch(batch_id)
     return {"status": "ENQUEUED", "batch_id": batch_id,
-            "rule_rows": rule_rows, "ai_rows": ai_rows,
-            "total_rows": rule_rows + ai_rows}
+            "rule_rows": rows_after_rules, "ai_rows": total_rows - rows_after_rules,
+            "total_rows": total_rows, "used_ai": use_ai}
+
+
+def _count_batch(batch_id: str) -> int:
+    """Ground truth for how many rows a batch has — used instead of DML rowcount,
+    which the Databricks SQL connector reports as -1 for INSERTs."""
+    import db
+    import queries
+    rows = db.run_query(queries.count_queue_rows(batch_id))
+    return int(rows[0]["n"]) if rows else 0

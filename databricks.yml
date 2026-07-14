@@ -121,6 +121,14 @@ resources:
         - environment_key: default
           spec:
             client: "3"
+      # The app runs as its own service principal and triggers this job via the
+      # SDK (jobs.py run_now). Without CAN_MANAGE_RUN the app can't even SEE the
+      # job (jobs.list returns empty) → "Job not found". Grant it here so it
+      # survives redeploys. ${workspace.current_user...} isn't the app SP, so we
+      # grant the app resource's SP via its application_id at deploy time.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          service_principal_name: ${resources.apps.tag-governance.service_principal_client_id}
 
     # Rolls a batch back — restores every tag to its pre-batch value from the audit log.
     tag-governance-rollback:
@@ -183,6 +191,20 @@ resources:
 targets:
   dev:
     default: true
+
+  # Azure fe-east workspace — admin live-write proof. User is a workspace admin
+  # here, so the writer can tag resources (unlike the non-admin e2-demo run).
+  fe-east:
+    workspace:
+      host: https://adb-984752964297111.11.azuredatabricks.net
+      profile: fe-east
+    variables:
+      warehouse_id: 148ccb90800933a1
+      summary_table: main.tag_governance.workload_daily
+      queue_table: main.tag_governance.write_queue
+      audit_table: main.tag_governance.audit
+      suggestions_table: main.tag_governance.suggestions
+
   # Example customer target — Bayada copies this, sets their host + values.
   # bayada:
   #   workspace:

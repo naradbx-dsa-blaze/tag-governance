@@ -44,6 +44,103 @@ SUGGESTIONS_TABLE = os.environ.get(
 # tag_keys aggregated up from the daily rows of one workload
 _AGG_KEYS = "array_distinct(flatten(collect_list(tag_keys)))"
 
+# Products that CANNOT take a per-resource custom_tags write — they attribute cost
+# via a budget/tag policy instead. This MUST mirror writer.POLICY_GOVERNED_REASON /
+# writer.attempt_write, or the app will promise tags the writer can't apply (and
+# the workload reappears forever). Serverless SQL is policy-governed too, but
+# non-serverless SQL warehouses are taggable, so SQL is handled by the flag.
+_POLICY_GOVERNED_PRODUCTS = ("APPS", "AI_GATEWAY", "INTERACTIVE", "LAKEFLOW_CONNECT")
+
+
+def _taggable_predicate(product_col="product", serverless_col="is_serverless"):
+    """SQL boolean: True only for workloads the writer can actually tag.
+
+    Excludes always-policy-governed products and serverless SQL — the exact rule
+    writer.attempt_write applies before dispatch.
+    """
+    plist = ", ".join(f"'{p}'" for p in _POLICY_GOVERNED_PRODUCTS)
+    return (f"({product_col} NOT IN ({plist}) "
+            f"AND NOT ({product_col} = 'SQL' AND {serverless_col} = 1))")
+
+
+# Products with a working per-resource tag WRITER (mirror writer._WRITERS, minus
+# the ones whose writer always returns UNSUPPORTED). Keep in sync with writer.py.
+#   - JOBS/ALL_PURPOSE/MODEL_SERVING/LAKEBASE/VECTOR_SEARCH/DATABASE: real API write
+#     (LAKEBASE/VECTOR_SEARCH need a recent SDK; on the deployed runtime they work).
+#   - SQL: taggable only when NOT serverless.
+#   - DLT: in _WRITERS but its writer returns UNSUPPORTED (UI/definition-only).
+_API_TAGGABLE_PRODUCTS = ("JOBS", "ALL_PURPOSE", "MODEL_SERVING", "LAKEBASE",
+                          "VECTOR_SEARCH", "DATABASE")
+
+
+def not_taggable_breakdown(tag_key, days, workspaces=None):
+    """Untagged spend the WRITER can't set via a per-resource custom_tags call —
+    but that is still attributable another way. Grouped by product with the correct
+    action. (Verified against Databricks docs: usage-detail-tags + budget-policies.)
+
+    Three buckets:
+      - POLICY_GOVERNED: serverless (Apps, serverless SQL, model serving, serverless
+        jobs, Lakeflow pipelines, Lakebase, AI Gateway). NOT untaggable — attributed
+        via a BUDGET POLICY (serverless usage policy). Set in the UI when creating/
+        editing the resource, or programmatically with the databricks_budget_policy
+        Terraform resource. Tags flow to system.billing.usage.custom_tags.
+      - UI_ONLY (DLT/SDP): tags live on the pipeline's clusters[].custom_tags — set
+        in the pipeline definition, not a standalone per-resource tag call.
+      - NO_API (Agent Bricks, Supervisor Agent, AI Functions, …): no documented tag
+        path today — verify in the resource UI / current docs.
+    Everything the writer CAN tag per-resource via API is excluded (normal flow)."""
+    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS)
+    plist = ", ".join(f"'{p}'" for p in _POLICY_GOVERNED_PRODUCTS)
+    taggable = ", ".join(f"'{p}'" for p in _API_TAGGABLE_PRODUCTS)
+    return f"""
+WITH wl AS (
+  SELECT product, workload_id,
+         MAX(is_serverless) AS is_serverless,
+         SUM(list_cost)     AS cost
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+  HAVING {untag_expr} AND SUM(list_cost) > 0
+),
+classified AS (
+  SELECT product,
+         CASE
+           WHEN product IN ({plist})                  THEN 'POLICY_GOVERNED'
+           WHEN product = 'SQL' AND is_serverless = 1  THEN 'POLICY_GOVERNED'
+           WHEN product = 'DLT'                        THEN 'UI_ONLY'
+           WHEN product = 'SQL' AND is_serverless = 0  THEN 'TAGGABLE'
+           WHEN product IN ({taggable})                THEN 'TAGGABLE'
+           ELSE 'NO_API'
+         END AS reason,
+         workload_id, cost
+  FROM wl
+)
+SELECT product,
+       reason,
+       COUNT(*)            AS workloads,
+       ROUND(SUM(cost), 0) AS cost
+FROM classified
+WHERE reason <> 'TAGGABLE'
+GROUP BY product, reason
+ORDER BY cost DESC
+"""
+
+
+def _not_already_handled(tag_key, product_col="product", workload_col="workload_id"):
+    """SQL boolean: True unless this (workload, tag_key) is ALREADY tagged or in
+    flight in the queue. The summary table's tag_keys is a daily snapshot, so
+    right after a write it still reads 'untagged' — this queries the live queue so
+    we never re-enqueue a workload already SUCCEEDED or still PENDING/RUNNING for
+    the same key. (FAILED/UNSUPPORTED rows are NOT excluded, so a fixed permission
+    can be retried.) This is the durable 'don't double-tag' guard."""
+    return f"""NOT EXISTS (
+    SELECT 1 FROM {QUEUE_TABLE} handled
+    WHERE handled.workload_id = {workload_col}
+      AND handled.product = {product_col}
+      AND handled.tag_key = {_sql_str(tag_key)}
+      AND handled.status IN ('SUCCEEDED', 'PENDING', 'RUNNING')
+  )"""
+
 
 def _missing_keys_predicate(tag_keys, col="tag_keys"):
     """True when the workload is missing ALL chosen keys.
@@ -351,6 +448,25 @@ LIMIT 50
 """
 
 
+def distinct_field_values(field, days, workspaces=None, limit=2000):
+    """Distinct values of a rule field (owner/product/workspace/name) among
+    untagged-relevant workloads, sorted alphabetically — to populate the
+    rules-builder picker so a user selects a real owner instead of typing a raw
+    email. Limit is high (a datalist is cheap) so alphabetical sort doesn't hide
+    owners late in the alphabet."""
+    col = {"owner": "owner", "product": "product",
+           "workspace": "workspace_id", "name": "workload_name"}.get(field, "owner")
+    return f"""
+SELECT {col} AS value, ROUND(SUM(list_cost), 0) AS cost,
+       COUNT(DISTINCT workload_id) AS workloads
+FROM {SUMMARY_TABLE}
+WHERE {_where(days, workspaces)} AND {col} IS NOT NULL AND {col} <> ''
+GROUP BY {col}
+ORDER BY lower({col}) ASC
+LIMIT {limit}
+"""
+
+
 def freshness():
     """Max usage_date in the summary table, to show 'data as of' in the UI."""
     return f"SELECT MAX(usage_date) AS as_of, COUNT(*) AS rows FROM {SUMMARY_TABLE}"
@@ -459,6 +575,12 @@ VALUES
 """
 
 
+def count_queue_rows(batch_id):
+    """Ground-truth row count for a batch — the app counts rows this way instead
+    of trusting DML rowcount (the SQL connector reports -1 for INSERTs)."""
+    return f"SELECT COUNT(*) AS n FROM {QUEUE_TABLE} WHERE batch_id = {_sql_str(batch_id)}"
+
+
 def batch_status(batch_id):
     """Per-status counts + cost for one batch — headline for the Batches tab."""
     return f"""
@@ -502,6 +624,25 @@ SELECT batch_id,
 FROM {QUEUE_TABLE}
 GROUP BY batch_id
 ORDER BY enqueued_at DESC
+LIMIT {limit}
+"""
+
+
+def batch_failure_breakdown(batch_id, limit=50):
+    """Per (product, status) rollup with a sample reason — so the batch view can
+    show WHY rows didn't tag (e.g. PermissionDenied on jobs you don't own),
+    instead of a bare 'FAILED' count that reads like success."""
+    return f"""
+SELECT product,
+       status,
+       COUNT(*)                 AS rows,
+       ROUND(SUM(list_cost), 0) AS cost,
+       MIN(last_error)          AS sample_reason
+FROM {QUEUE_TABLE}
+WHERE batch_id = {_sql_str(batch_id)}
+  AND status IN ('FAILED', 'UNSUPPORTED')
+GROUP BY product, status
+ORDER BY rows DESC
 LIMIT {limit}
 """
 
@@ -588,6 +729,13 @@ cand AS (
   WHERE s.suggested_cost_center IS NOT NULL
     AND lower(s.suggested_cost_center) <> 'unknown'
     AND s.confidence >= {float(min_confidence)}
+    -- Only surface workloads the writer can actually tag; policy-governed
+    -- products (Apps, serverless SQL, …) would be enqueued then skipped
+    -- UNSUPPORTED and reappear next time. Filter them out here.
+    AND {_taggable_predicate('wl.product', 'wl.is_serverless')}
+    -- Don't double-tag: skip workloads already tagged/in-flight for this key.
+    -- The summary snapshot lags a live write by up to a day, so check the queue.
+    AND {_not_already_handled(tag_key, 'wl.product', 'wl.workload_id')}
 )"""
 
 
@@ -602,6 +750,34 @@ FROM cand
 """
 
 
+def policy_governed_impact(tag_key, min_confidence, days, workspaces=None):
+    """Untagged workloads that have a confident suggestion but CANNOT be tagged by
+    the writer (Apps, serverless SQL, …). Surfaced so the UI can explain why they
+    aren't in the apply list instead of silently dropping them — they need a
+    budget/tag policy, not a per-resource write."""
+    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS)
+    return f"""
+WITH wl AS (
+  SELECT product, workload_id,
+         MAX(is_serverless) AS is_serverless,
+         SUM(list_cost)     AS cost
+  FROM {SUMMARY_TABLE}
+  WHERE {_where(days, workspaces)}
+  GROUP BY product, workload_id
+  HAVING {untag_expr} AND SUM(list_cost) > 0
+)
+SELECT COUNT(*)               AS workloads,
+       ROUND(SUM(wl.cost), 0) AS cost
+FROM wl
+JOIN {SUGGESTIONS_TABLE} s
+  ON s.workload_id = wl.workload_id AND s.product = wl.product
+WHERE s.suggested_cost_center IS NOT NULL
+  AND lower(s.suggested_cost_center) <> 'unknown'
+  AND s.confidence >= {float(min_confidence)}
+  AND NOT {_taggable_predicate('wl.product', 'wl.is_serverless')}
+"""
+
+
 def suggestions_bulk_breakdown(tag_key, min_confidence, days, workspaces=None, limit=50):
     """Per-suggested-value coverage, so the human sees WHAT would be assigned."""
     cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
@@ -612,6 +788,24 @@ SELECT suggested_cost_center AS value,
        ROUND(MIN(confidence), 2) AS min_conf
 FROM cand
 GROUP BY suggested_cost_center
+ORDER BY cost DESC
+LIMIT {limit}
+"""
+
+
+def suggestions_bulk_list(tag_key, min_confidence, days, workspaces=None, limit=100):
+    """The CONCRETE per-workload list: exactly which workloads get tagged and with
+    what value. This is what a human needs to see before clicking apply — one row
+    per workload, highest-cost first, showing the tag value the AI would set."""
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
+    return cte + f"""
+SELECT product,
+       workload_id,
+       workload_name,
+       ROUND(cost, 0)            AS cost,
+       suggested_cost_center     AS new_tag_value,
+       ROUND(confidence, 2)      AS confidence
+FROM cand
 ORDER BY cost DESC
 LIMIT {limit}
 """

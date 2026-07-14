@@ -104,12 +104,20 @@ def _write_job(client, workload_id: str, name: str, key: str, value: str | None,
         return WriteResult.ok(old, value, noop=True)
     if dry_run:
         return WriteResult.ok(old, value, dry_run=True)
-    # NOTE: jobs.update MERGES the tags map — omitting a key does NOT remove it,
-    # so update can't do rollback (key removal). jobs.reset does a full settings
-    # REPLACE, which sets tags to exactly `merged`. We read the complete settings
-    # and swap only .tags, so nothing else changes. (Verified against a live job.)
-    settings.tags = merged
-    client.jobs.reset(job_id=job_id, new_settings=settings)
+    # Two write modes, picked by whether we're SETTING or REMOVING a key:
+    #  - SET (value is not None): jobs.update with ONLY tags in new_settings. This
+    #    is a PARTIAL merge — it changes nothing but the tags map, so the owner's
+    #    schedule/tasks/clusters/params are untouched. Safest for tagging jobs we
+    #    don't own. (Verified: update preserves all other settings on a live job.)
+    #  - REMOVE (value is None, i.e. rollback): update MERGES and can't drop a key,
+    #    so we fall back to jobs.reset (full settings REPLACE) with the complete
+    #    settings and only .tags swapped, which sets tags to exactly `merged`.
+    from databricks.sdk.service.jobs import JobSettings
+    if value is not None:
+        client.jobs.update(job_id=job_id, new_settings=JobSettings(tags=merged))
+    else:
+        settings.tags = merged
+        client.jobs.reset(job_id=job_id, new_settings=settings)
     return WriteResult.ok(old, value)
 
 
