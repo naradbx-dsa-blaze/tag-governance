@@ -184,7 +184,7 @@ def rule_preview(body: RulePreviewBody):
         impact = db.run_query(
             queries.bulk_rule_impact(body.days, [body.tag_key], body.rules))
         sample = db.run_query(
-            queries.bulk_rule_sample(body.days, [body.tag_key], body.rules, limit=200))
+            queries.bulk_rule_sample(body.days, [body.tag_key], body.rules, limit=500))
         return {"impact": impact[0] if impact else {}, "workloads": sample}
     except Exception as e:  # noqa: BLE001
         return _err(e)
@@ -644,9 +644,13 @@ async function doRulePreview(){
               `style="width:140px;padding:5px 8px"></td></tr>`;
     });
     html += "</table></div>";
-    if(wl.length < (i.matched_count||0))
-      html += `<div class=note>Showing top ${wl.length} by cost of ${i.matched_count}. `+
-              `(Only the workloads shown here can be individually unchecked/edited.)</div>`;
+    if(wl.length < (i.matched_count||0)){
+      const hidden = (i.matched_count||0) - wl.length;
+      html += `<div class="banner warn">⚠️ This rule matches <b>${(i.matched_count||0).toLocaleString()}</b> `+
+              `workloads but only the top <b>${wl.length}</b> by cost are shown/reviewable. `+
+              `<b>Applying tags ONLY the ${wl.length} shown</b> — the other ${hidden.toLocaleString()} `+
+              `are NOT tagged. Narrow the rule (or tag in batches) to review them all.</div>`;
+    }
   }
   $("#rulePreviewBox").innerHTML = html;
   ruleSelCount();
