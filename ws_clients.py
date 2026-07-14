@@ -23,8 +23,22 @@ from __future__ import annotations
 
 import os
 
-_ACCOUNT_HOST = os.environ.get(
-    "DATABRICKS_ACCOUNT_HOST", "https://accounts.cloud.databricks.com")
+
+def _default_account_host() -> str:
+    """Account console host for the CURRENT cloud — so M2 is portable, not AWS-only.
+    Overridable with DATABRICKS_ACCOUNT_HOST. Inferred from the workspace host."""
+    explicit = os.environ.get("DATABRICKS_ACCOUNT_HOST")
+    if explicit:
+        return explicit
+    ws = (os.environ.get("DATABRICKS_HOST") or "").lower()
+    if "azuredatabricks.net" in ws:
+        return "https://accounts.azuredatabricks.net"
+    if "gcp.databricks.com" in ws:
+        return "https://accounts.gcp.databricks.com"
+    return "https://accounts.cloud.databricks.com"  # AWS default
+
+
+_ACCOUNT_HOST = _default_account_host()
 
 
 def account_creds_present() -> bool:

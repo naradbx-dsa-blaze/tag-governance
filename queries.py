@@ -17,29 +17,22 @@ Args:
 
 import os
 
-# The summary table location is configurable so the app can be deployed into any
-# account (e.g. Bayada's) by setting TAG_GOVERNANCE_SUMMARY_TABLE — no code change.
-SUMMARY_TABLE = os.environ.get(
-    "TAG_GOVERNANCE_SUMMARY_TABLE",
-    "users.narasimha_kamathardi.tag_governance_workload_daily",
-)
 
-# Write-queue and audit tables — configurable for cross-account deploys, same as
-# SUMMARY_TABLE. The app INSERTs intent into QUEUE_TABLE; the writer job drains it
-# and records changes to AUDIT_TABLE.
-QUEUE_TABLE = os.environ.get(
-    "TAG_GOVERNANCE_QUEUE_TABLE",
-    "users.narasimha_kamathardi.tag_governance_write_queue",
-)
-AUDIT_TABLE = os.environ.get(
-    "TAG_GOVERNANCE_AUDIT_TABLE",
-    "users.narasimha_kamathardi.tag_governance_audit",
-)
-# Advisory ai_query suggestions (agent hints). Read-only join for the UI.
-SUGGESTIONS_TABLE = os.environ.get(
-    "TAG_GOVERNANCE_SUGGESTIONS_TABLE",
-    "users.narasimha_kamathardi.tag_governance_suggestions",
-)
+def _table_env(var: str) -> str:
+    """Resolve a fully-qualified table name from env. The bundle always sets these
+    per-target; if one is missing we DON'T silently fall back to a demo schema
+    (which would read the wrong account's data) — we point at an obvious sentinel
+    so the failure names the misconfigured variable instead of tagging blind."""
+    val = os.environ.get(var, "").strip()
+    return val or f"__UNSET_{var}__"
+
+
+# All table locations are per-deploy env vars (set by the bundle), so the app is
+# portable to any account with zero code change. See databricks.yml variables.
+SUMMARY_TABLE = _table_env("TAG_GOVERNANCE_SUMMARY_TABLE")
+QUEUE_TABLE = _table_env("TAG_GOVERNANCE_QUEUE_TABLE")
+AUDIT_TABLE = _table_env("TAG_GOVERNANCE_AUDIT_TABLE")
+SUGGESTIONS_TABLE = _table_env("TAG_GOVERNANCE_SUGGESTIONS_TABLE")
 
 # tag_keys aggregated up from the daily rows of one workload
 _AGG_KEYS = "array_distinct(flatten(collect_list(tag_keys)))"
