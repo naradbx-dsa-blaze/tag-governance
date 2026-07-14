@@ -115,8 +115,28 @@ surprises in front of a customer.
 | **Serverless SQL / Apps (~41% of spend)** | ℹ️ Reported, not tagged | Not per-resource taggable — attribute via **budget/tag policy**. The tool flags these as `UNSUPPORTED` with a reason (honest, not silent). |
 | **Advisory AI suggestions** | ✅ Proven | `ai_query` hint column + one-click "Bulk tag (AI)"; conservative (low-confidence `unknown` for cryptic workloads); never writes. Weekly job to limit inference cost; tunable/optional — see "Cost knob" below. |
 
-**Ship-ready today at the M1 tier + honest reporting.** Full-account M2 is one
-documented admin step (provision + entitle the account SP) away from live.
+**Ship-ready at the M1 (single-workspace) tier + honest reporting.**
+
+### Production hardening status
+
+What's been done to move this from demo to production-grade, and what a customer
+still owns:
+
+| Area | Status | Detail |
+|------|--------|--------|
+| **AuthZ on live writes** | ✅ Done | Live writes gated behind `TAG_GOVERNANCE_ADMIN_GROUP`; membership checked as the requesting user (Apps-forwarded token), fails closed. Reads/dry-runs open. Requester email recorded on every batch. **Set the group before production** (default `OPEN` = dev only). |
+| **SQL-injection hardening** | ✅ Done | Tag keys/values validated against a safe charset at the API boundary (400 on bad input) + `_sql_str` escapes quotes/backslashes/NUL. Verified: `'; DROP TABLE` → rejected. |
+| **Automated tests** | ✅ Done | 25 stdlib-`unittest` tests over the security/correctness logic (escaping, validation, taggability↔writer parity, plan rejection, merge, rule predicates). `python -m unittest discover -s tests`. |
+| **CI** | ⚙️ Config shipped | `ci.yml.github-workflow` (compile + ruff + tests on push/PR). Rename to `.github/workflows/ci.yml` and push with a `workflow`-scoped token to activate (the file couldn't be pushed there directly). |
+| **Logging / error handling** | ✅ Done | Structured stdout logs (Apps-captured); every write attempt logs action+user+mode+authorized. Errors return a safe message + correlation id — no stack/internal leak to the browser. |
+| **DB connection resilience** | ✅ Done | A dropped connection (idle-stop, network, token refresh) self-heals: failing statement reconnects + retries once. |
+| **No silent truncation** | ✅ Done | Rule preview shows up to 500 matched workloads; if a rule matches more, a loud banner states exactly how many are shown vs NOT tagged. |
+| **M1 write throughput** | ✅ Measured | Dry-run drain over the home-workspace slice; per-resource GET, 8-way concurrency, 429 backoff, resumable. Note: deleted resources (billing history outlives them) return `ResourceDoesNotExist` → FAILED (harmless). |
+| **Cross-workspace (M2)** | ❌ Out of scope | Descoped by request. The tool runs M1 (home workspace only); rows for other workspaces are left `PENDING`/`FAILED`, never mis-tagged. |
+
+**Customer still owns:** setting `TAG_GOVERNANCE_ADMIN_GROUP`, making the app/writer
+service principal a workspace admin (so it can tag resources it doesn't own),
+activating CI, and choosing budget/tag policies for the serverless (~41%) slice.
 
 ---
 
