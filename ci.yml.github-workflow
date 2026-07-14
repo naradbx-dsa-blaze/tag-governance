@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Byte-compile all modules
+        run: python -m compileall -q app.py authz.py db.py jobs.py queries.py tagging.py writer.py writer_job.py rollback_job.py ws_clients.py
+
+      - name: Lint (ruff)
+        run: ruff check --select E9,F63,F7,F82 .   # syntax/undefined-name errors fail the build
+
+      - name: Unit tests
+        env:
+          TAG_GOVERNANCE_SUMMARY_TABLE: t.t.summary
+          TAG_GOVERNANCE_QUEUE_TABLE: t.t.queue
+          TAG_GOVERNANCE_AUDIT_TABLE: t.t.audit
+          TAG_GOVERNANCE_SUGGESTIONS_TABLE: t.t.sugg
+        run: python -m unittest discover -s tests -v
