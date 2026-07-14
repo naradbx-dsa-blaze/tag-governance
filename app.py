@@ -110,6 +110,28 @@ def rule_preview(body: RulePreviewBody):
         return _err(e)
 
 
+class TagSelectedBody(BaseModel):
+    tag_key: str = "cost_center"
+    workloads: list          # the CHECKED rows from the preview, each a dict
+    dry_run: bool = True
+
+
+@app.post("/api/tag-selected")
+def tag_selected(body: TagSelectedBody):
+    """Apply tags to ONLY the workloads the user kept checked in the preview.
+    Enqueues exactly this list (each with its own value) — unchecked rows are
+    never queued — then runs the writer."""
+    try:
+        result = tagging.tag_selected(body.tag_key, body.workloads)
+        if result.get("status") != "ENQUEUED" or result.get("total_rows", 0) == 0:
+            return {**result, "run": None,
+                    "message": result.get("message", "No workloads selected.")}
+        run = jobs.run_writer(result["batch_id"], dry_run=body.dry_run)
+        return {**result, "run": run}
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
 class ManualTagBody(BaseModel):
     product: str
     workload_id: str
@@ -306,8 +328,6 @@ INDEX_HTML = """<!doctype html>
         <table id="rulesTable"><tr><th>If field</th><th>operator</th><th>value</th>
           <th>→ set value</th><th></th></tr></table>
         <button class="ghost" onclick="addRule()">+ Add rule</button>
-        <div class="toggle"><input type="checkbox" id="rulesUseAi">
-          <label for="rulesUseAi" style="margin:0">Also use AI for workloads no rule matched (off = pure rules)</label></div>
         <div class="row" style="margin-top:6px">
           <button onclick="doRulePreview()">1️⃣ Show the workloads this will tag</button>
         </div>
@@ -502,42 +522,73 @@ async function doRulePreview(){
     body:JSON.stringify({tag_key:$("#tagKey").value, days:+$("#days").value, rules})})).json();
   if(r.error){ $("#rulePreviewBox").innerHTML='<div class="banner warn">'+r.error+'</div>'; return; }
   const i=r.impact||{}, wl=r.workloads||[];
+  _ruleWorkloads = wl;   // stash for apply — we tag exactly the CHECKED rows
   let html =
     `<div class="banner info">These rules match <b>${(i.matched_count||0).toLocaleString()}</b> `+
     `of ${(i.total_untagged||0).toLocaleString()} untagged workloads `+
     `(<b>${money(i.matched_cost)}</b> of ${money(i.total_untagged_cost)}). `+
-    `<b>Review the exact list below</b> — make sure a rule isn't lumping unrelated `+
-    `workloads under one team.</div>`;
+    `<b>Uncheck any that don't belong</b> (e.g. an ML workload that shouldn't be `+
+    `this team) — only checked rows get tagged.</div>`;
   if(wl.length){
+    html += `<div style="margin:6px 0"><button class=ghost style="margin:0;padding:4px 10px" `+
+            `onclick="ruleToggleAll(true)">Check all</button> `+
+            `<button class=ghost style="margin:0;padding:4px 10px" `+
+            `onclick="ruleToggleAll(false)">Uncheck all</button> `+
+            `<span id=ruleSel class=note></span></div>`;
     html += "<div style='max-height:340px;overflow:auto'><table>"+
-            "<tr><th>Workload</th><th>Product</th><th>Owner</th>"+
+            "<tr><th></th><th>Workload</th><th>Product</th><th>Owner</th>"+
             "<th class=num>Cost</th><th>Will be tagged</th></tr>";
-    for(const w of wl)
-      html += `<tr><td>${w.workload_name||'—'}</td><td>${w.product}</td>`+
+    wl.forEach((w, idx) => {
+      html += `<tr><td><input type=checkbox class=rwsel data-i="${idx}" checked onchange="ruleSelCount()"></td>`+
+              `<td>${w.workload_name||'—'}</td><td>${w.product}</td>`+
               `<td class=muted>${w.owner||'—'}</td><td class=num>${money(w.cost)}</td>`+
               `<td><span class=pill>${$("#tagKey").value} = ${w.new_tag_value}</span></td></tr>`;
+    });
     html += "</table></div>";
     if(wl.length < (i.matched_count||0))
-      html += `<div class=note>Showing top ${wl.length} by cost of ${i.matched_count}.</div>`;
+      html += `<div class=note>Showing top ${wl.length} by cost of ${i.matched_count}. `+
+              `(Only the workloads shown here can be individually unchecked.)</div>`;
   }
   $("#rulePreviewBox").innerHTML = html;
-  $("#rulesApplyRow").style.display="block";
+  ruleSelCount();
+  $("#rulesApplyRow").style.display = wl.length ? "block" : "none";
+}
+let _ruleWorkloads = [];
+function ruleToggleAll(on){
+  for(const c of document.querySelectorAll(".rwsel")) c.checked = on;
+  ruleSelCount();
+}
+function ruleSelCount(){
+  const checked = document.querySelectorAll(".rwsel:checked").length;
+  const el = $("#ruleSel"); if(el) el.textContent = `${checked} selected`;
+}
+function selectedRuleWorkloads(){
+  const out = [];
+  for(const c of document.querySelectorAll(".rwsel:checked")){
+    const w = _ruleWorkloads[+c.dataset.i];
+    if(w) out.push({workload_id:w.workload_id, product:w.product,
+      workspace_id:w.workspace_id, workload_name:w.workload_name,
+      is_serverless:w.is_serverless, tag_value:w.new_tag_value, cost:w.cost});
+  }
+  return out;
 }
 async function doRulesApply(){
-  const rules = collectRules();
-  if(!rules.length){ return; }
+  // Tag EXACTLY the checked rows from the preview — not "whatever the rule matches".
+  // So unchecking the ML workloads means they're never queued.
+  const selected = selectedRuleWorkloads();
+  if(!selected.length){
+    $("#result").innerHTML='<div class="banner warn">No workloads checked — nothing to tag.</div>'; return; }
   const dry = $("#rulesDryRun").checked;
-  if(!confirmLive(dry, "every workload these rules match")) return;
-  $("#result").innerHTML='<div class="note">Enqueuing rules + starting writer…</div>';
-  const body = { tag_key:$("#tagKey").value, days:+$("#days").value, rules,
-                 use_ai:$("#rulesUseAi").checked, dry_run:dry };
-  const r = await (await fetch("/api/auto-tag",{method:"POST",
+  if(!confirmLive(dry, `the ${selected.length} checked workload(s)`)) return;
+  $("#result").innerHTML='<div class="note">Enqueuing selected workloads + starting writer…</div>';
+  const body = { tag_key:$("#tagKey").value, workloads:selected, dry_run:dry };
+  const r = await (await fetch("/api/tag-selected",{method:"POST",
     headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)})).json();
   if(r.error){ $("#result").innerHTML='<div class="banner warn">'+r.error+'</div>'; return; }
-  if(!r.run){ $("#result").innerHTML='<div class="banner warn">'+(r.message||"Nothing matched")+'</div>'; return; }
+  if(!r.run){ $("#result").innerHTML='<div class="banner warn">'+(r.message||"Nothing to tag")+'</div>'; return; }
   const md = r.run.dry_run?"<b>dry-run</b>":"<b>LIVE</b>";
   $("#result").innerHTML=`<div class="banner info">Batch <span class=pill>${r.batch_id}</span> — `+
-    `${r.rule_rows} by rules${r.ai_rows?`, ${r.ai_rows} by AI`:" (no AI)"}. `+
+    `${r.total_rows} workload(s) queued. `+
     `Writer started in ${md}: <a href="${r.run.url}" target=_blank>view run →</a></div>`;
   loadBatches();
 }

@@ -415,7 +415,8 @@ WITH wl AS (
   GROUP BY product, workload_id
 ),
 matched AS (
-  SELECT product, workload_name, owner, ROUND(cost,0) AS cost,
+  SELECT workload_id, product, workspace_id, workload_name, owner,
+         is_serverless, ROUND(cost,0) AS cost,
          CASE
 {ladder}
            ELSE -1 END AS first_rule
@@ -423,7 +424,8 @@ matched AS (
   WHERE is_untagged AND cost > 0 AND ({any_match})
     AND {_taggable_predicate('product', 'is_serverless')}
 )
-SELECT product, workload_name, owner, cost,
+SELECT workload_id, product, workspace_id, workload_name, owner,
+       is_serverless, cost,
        CASE first_rule
 {val_ladder}
        END AS new_tag_value
@@ -588,6 +590,41 @@ def enqueue_single_sql(batch_id, requested_by, workspace_id, product, workload_i
             f"{_sql_str(workspace_id)}, {_sql_str(product)}, {_sql_str(workload_id)}, "
             f"{_sql_str(workload_name or workload_id)}, {1 if is_serverless else 0}, "
             f"{_sql_str(k)}, {_sql_str(v)}, {cost_sql}, 'PENDING', 0)")
+    values = ",\n  ".join(rows)
+    return f"""
+INSERT INTO {QUEUE_TABLE}
+  (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
+   workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
+VALUES
+  {values}
+"""
+
+
+def enqueue_explicit_sql(batch_id, requested_by, tag_key, workloads):
+    """INSERT one row per workload from an EXPLICIT, user-selected list.
+
+    This is the "review the list, uncheck the ones that don't belong, apply only
+    the rest" path — the frontend sends exactly the workloads the human confirmed,
+    each with its own tag value. Unlike enqueue_bulk_sql it does NOT re-evaluate a
+    rule, so unchecked rows are simply never inserted. Each workload dict:
+      {workload_id, product, workspace_id, workload_name, is_serverless, tag_value, cost}
+    Returns None if the list is empty.
+    """
+    rows = []
+    for w in workloads:
+        if not w.get("workload_id") or not w.get("tag_value"):
+            continue
+        cost = w.get("cost")
+        cost_sql = "NULL" if cost in (None, "") else f"CAST({float(cost)} AS DECIMAL(38,6))"
+        rows.append(
+            f"({_sql_str(batch_id)}, current_timestamp(), {_sql_str(requested_by)}, "
+            f"{_sql_str(str(w.get('workspace_id') or ''))}, {_sql_str(w['product'])}, "
+            f"{_sql_str(str(w['workload_id']))}, "
+            f"{_sql_str(w.get('workload_name') or str(w['workload_id']))}, "
+            f"{1 if w.get('is_serverless') else 0}, "
+            f"{_sql_str(tag_key)}, {_sql_str(w['tag_value'])}, {cost_sql}, 'PENDING', 0)")
+    if not rows:
+        return None
     values = ",\n  ".join(rows)
     return f"""
 INSERT INTO {QUEUE_TABLE}

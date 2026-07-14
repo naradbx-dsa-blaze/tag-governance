@@ -213,6 +213,26 @@ def enqueue_from_suggestions(batch_id: str, tag_key: str, min_confidence: float,
     return inserted if (inserted is not None and inserted >= 0) else None
 
 
+def tag_selected(tag_key: str, workloads: list) -> dict:
+    """Enqueue an EXPLICIT, user-selected list of workloads (each with its own
+    value) as one batch. This is the "review the rule's matches, uncheck the ones
+    that don't belong, apply only the rest" path — nothing is re-derived from a
+    rule, so unchecked rows are simply never queued. Returns {batch_id, total_rows}.
+    """
+    import db
+    import queries
+    batch_id = _new_batch_id()
+    sql = queries.enqueue_explicit_sql(
+        batch_id=batch_id, requested_by=_requested_by(),
+        tag_key=tag_key, workloads=workloads,
+    )
+    if sql is None:
+        return {"status": "NO_ROWS", "message": "No workloads selected."}
+    db.run_exec(sql)
+    total = _count_batch(batch_id)
+    return {"status": "ENQUEUED", "batch_id": batch_id, "total_rows": total}
+
+
 def auto_tag(tag_key: str, days: int, rules: list | None = None,
              min_confidence: float = 0.8, workspaces=None,
              use_ai: bool = True) -> dict:
