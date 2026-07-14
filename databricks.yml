@@ -31,6 +31,9 @@ variables:
   account_sp_scope:
     description: "Secret scope with the account-SP OAuth creds for M2 cross-workspace writes (empty = M1 home only)"
     default: ""
+  admin_group:
+    description: "Group whose members may run LIVE tag writes. 'OPEN' = no restriction (dev only); SET to a real group before production."
+    default: "OPEN"
 
 resources:
   jobs:
@@ -187,6 +190,10 @@ resources:
             value: ${var.audit_table}
           - name: TAG_GOVERNANCE_SUGGESTIONS_TABLE
             value: ${var.suggestions_table}
+          # Group whose members may run LIVE tag writes. Empty = open (dev only) —
+          # SET THIS to a real group before customer/production use.
+          - name: TAG_GOVERNANCE_ADMIN_GROUP
+            value: ${var.admin_group}
 
 targets:
   dev:

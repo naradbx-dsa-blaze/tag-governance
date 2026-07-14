@@ -168,9 +168,19 @@ def _new_batch_id() -> str:
     return f"batch-{uuid.uuid4().hex[:12]}"
 
 
+# Per-request requester email, set by the app from the Apps-forwarded identity so
+# the audit/queue records WHO enqueued each batch (not a generic "app").
+import contextvars
+_requester = contextvars.ContextVar("requester", default="")
+
+
+def set_requester(email: str) -> None:
+    _requester.set(email or "")
+
+
 def _requested_by() -> str:
     import os
-    return os.environ.get("TAG_GOVERNANCE_USER") or "app"
+    return _requester.get() or os.environ.get("TAG_GOVERNANCE_USER") or "app"
 
 
 def enqueue_single(plan: "TagPlan", workspace_id: str, is_serverless: bool = False,

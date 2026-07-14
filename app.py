@@ -11,10 +11,11 @@ writer/rollback jobs, which do the safe, audited, resumable writes.
 from __future__ import annotations
 
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+import authz
 import db
 import jobs
 import queries
@@ -28,6 +29,36 @@ DEFAULT_DAYS = int(os.environ.get("TAG_GOVERNANCE_DAYS", "30"))
 
 def _err(e: Exception, status: int = 500) -> JSONResponse:
     return JSONResponse({"error": str(e)}, status_code=status)
+
+
+def _deny(reason: str) -> JSONResponse:
+    return JSONResponse({"error": reason, "denied": True}, status_code=403)
+
+
+def _gate_live_write(request: Request, dry_run: bool):
+    """Return a 403 JSONResponse if this LIVE write isn't authorized, else None.
+    Also stamps the requester email so batches record WHO acted. Dry-runs are
+    always allowed (they mutate nothing) but still record the requester."""
+    tagging.set_requester(authz.requester_email(request.headers))
+    if dry_run:
+        return None
+    ok, reason = authz.authorize_write(request.headers)
+    return None if ok else _deny(reason)
+
+
+@app.get("/api/whoami")
+def whoami(request: Request):
+    """Who the app sees you as (from the Apps-forwarded identity) and whether you
+    may run live writes. Never echoes the token itself — only its presence."""
+    h = request.headers
+    ok, reason = authz.authorize_write(h)
+    return {
+        "email": authz.requester_email(h),
+        "display_name": h.get("x-forwarded-preferred-username"),
+        "can_write": ok,
+        "reason": reason,
+        "admin_group": authz.ADMIN_GROUP or "(open — dev mode)",
+    }
 
 
 # ----------------------------------------------------------------------------- API
@@ -70,10 +101,13 @@ class AutoTagBody(BaseModel):
 
 
 @app.post("/api/auto-tag")
-def auto_tag(body: AutoTagBody):
+def auto_tag(body: AutoTagBody, request: Request):
     """Seamless: enqueue rules (+ optional AI fallback) as one batch, run writer.
 
     use_ai=False → pure rules, no AI-proposed tags (for AI-averse customers)."""
+    denied = _gate_live_write(request, body.dry_run)
+    if denied:
+        return denied
     try:
         result = tagging.auto_tag(
             tag_key=body.tag_key, days=body.days, rules=body.rules,
@@ -117,10 +151,13 @@ class TagSelectedBody(BaseModel):
 
 
 @app.post("/api/tag-selected")
-def tag_selected(body: TagSelectedBody):
+def tag_selected(body: TagSelectedBody, request: Request):
     """Apply tags to ONLY the workloads the user kept checked in the preview.
     Enqueues exactly this list (each with its own value) — unchecked rows are
     never queued — then runs the writer."""
+    denied = _gate_live_write(request, body.dry_run)
+    if denied:
+        return denied
     try:
         result = tagging.tag_selected(body.tag_key, body.workloads)
         if result.get("status") != "ENQUEUED" or result.get("total_rows", 0) == 0:
@@ -145,8 +182,11 @@ class ManualTagBody(BaseModel):
 
 
 @app.post("/api/manual-tag")
-def manual_tag(body: ManualTagBody):
+def manual_tag(body: ManualTagBody, request: Request):
     """Tag ONE workload with an explicitly typed value — no AI, no rules."""
+    denied = _gate_live_write(request, body.dry_run)
+    if denied:
+        return denied
     try:
         plan = tagging.plan_for(
             product=body.product, workload_id=body.workload_id,
@@ -206,7 +246,10 @@ class BatchBody(BaseModel):
 
 
 @app.post("/api/rollback")
-def rollback(body: BatchBody):
+def rollback(body: BatchBody, request: Request):
+    denied = _gate_live_write(request, body.dry_run)
+    if denied:
+        return denied
     try:
         return {"run": jobs.run_rollback(body.batch_id, dry_run=body.dry_run)}
     except Exception as e:  # noqa: BLE001
