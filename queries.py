@@ -386,30 +386,49 @@ GROUP BY first_rule ORDER BY first_rule
 """
 
 
-def bulk_rule_sample(days, tag_keys, rules, workspaces=None, limit=50):
-    """A small sample of matched workloads, with which rule (priority) tags each."""
+def bulk_rule_sample(days, tag_keys, rules, workspaces=None, limit=200):
+    """The CONCRETE per-workload list a rule set would tag: name, product, owner,
+    cost, AND the exact value each gets (from the first rule that matches). This is
+    what a human reviews before applying, so they can catch a rule that lumps
+    unrelated workloads under one team. Only taggable workloads (writer can't tag
+    Apps/serverless/etc., so they'd never be enqueued — don't show them here)."""
     valid = [r for r in rules if r.get("value") and r.get("tags")]
     if not valid:
         return None
     any_match = " OR ".join(f"({_rule_sql_predicate(r)})" for r in valid)
     ladder = "\n".join(
         f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    # map first_rule index -> the tag value it assigns for `tag_keys[0]`
+    key = tag_keys[0]
+    val_ladder = "\n".join(
+        f"      WHEN {i} THEN {_sql_str(r['tags'].get(key, ''))}"
+        for i, r in enumerate(valid))
     return f"""
 WITH wl AS (
   SELECT workload_id, product,
          MAX(workspace_id) AS workspace_id, MAX(workload_name) AS workload_name, MAX(owner) AS owner,
+         MAX(is_serverless) AS is_serverless,
          {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
          SUM(list_cost) AS cost
   FROM {SUMMARY_TABLE}
   WHERE {_where(days, workspaces)}
   GROUP BY product, workload_id
-)
-SELECT product, workload_name, owner, ROUND(cost,0) AS cost,
-       CASE
+),
+matched AS (
+  SELECT product, workload_name, owner, ROUND(cost,0) AS cost,
+         CASE
 {ladder}
-         ELSE -1 END AS first_rule
-FROM wl
-WHERE is_untagged AND cost > 0 AND ({any_match})
+           ELSE -1 END AS first_rule
+  FROM wl
+  WHERE is_untagged AND cost > 0 AND ({any_match})
+    AND {_taggable_predicate('product', 'is_serverless')}
+)
+SELECT product, workload_name, owner, cost,
+       CASE first_rule
+{val_ladder}
+       END AS new_tag_value
+FROM matched
+WHERE first_rule >= 0
 ORDER BY cost DESC
 LIMIT {limit}
 """

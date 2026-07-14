@@ -97,11 +97,15 @@ class RulePreviewBody(BaseModel):
 
 @app.post("/api/rule-preview")
 def rule_preview(body: RulePreviewBody):
-    """How many workloads / how much cost a rule set would tag — no AI, no writes."""
+    """What a rule set would tag: aggregate impact + the CONCRETE per-workload list
+    (name/product/owner/cost + the exact value each gets), so a human can catch a
+    rule that mislabels unrelated workloads before applying. No AI, no writes."""
     try:
         impact = db.run_query(
             queries.bulk_rule_impact(body.days, [body.tag_key], body.rules))
-        return {"impact": impact[0] if impact else {}}
+        sample = db.run_query(
+            queries.bulk_rule_sample(body.days, [body.tag_key], body.rules, limit=200))
+        return {"impact": impact[0] if impact else {}, "workloads": sample}
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -488,11 +492,26 @@ async function doRulePreview(){
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({tag_key:$("#tagKey").value, days:+$("#days").value, rules})})).json();
   if(r.error){ $("#rulePreviewBox").innerHTML='<div class="banner warn">'+r.error+'</div>'; return; }
-  const i=r.impact||{};
-  $("#rulePreviewBox").innerHTML =
+  const i=r.impact||{}, wl=r.workloads||[];
+  let html =
     `<div class="banner info">These rules match <b>${(i.matched_count||0).toLocaleString()}</b> `+
     `of ${(i.total_untagged||0).toLocaleString()} untagged workloads `+
-    `(<b>${money(i.matched_cost)}</b> of ${money(i.total_untagged_cost)}).</div>`;
+    `(<b>${money(i.matched_cost)}</b> of ${money(i.total_untagged_cost)}). `+
+    `<b>Review the exact list below</b> — make sure a rule isn't lumping unrelated `+
+    `workloads under one team.</div>`;
+  if(wl.length){
+    html += "<div style='max-height:340px;overflow:auto'><table>"+
+            "<tr><th>Workload</th><th>Product</th><th>Owner</th>"+
+            "<th class=num>Cost</th><th>Will be tagged</th></tr>";
+    for(const w of wl)
+      html += `<tr><td>${w.workload_name||'—'}</td><td>${w.product}</td>`+
+              `<td class=muted>${w.owner||'—'}</td><td class=num>${money(w.cost)}</td>`+
+              `<td><span class=pill>${$("#tagKey").value} = ${w.new_tag_value}</span></td></tr>`;
+    html += "</table></div>";
+    if(wl.length < (i.matched_count||0))
+      html += `<div class=note>Showing top ${wl.length} by cost of ${i.matched_count}.</div>`;
+  }
+  $("#rulePreviewBox").innerHTML = html;
   $("#rulesApplyRow").style.display="block";
 }
 async function doRulesApply(){
