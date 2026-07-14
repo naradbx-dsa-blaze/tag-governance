@@ -10,7 +10,9 @@ writer/rollback jobs, which do the safe, audited, resumable writes.
 """
 from __future__ import annotations
 
+import logging
 import os
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -21,6 +23,14 @@ import jobs
 import queries
 import tagging
 
+# Structured logging to stdout (captured by Databricks Apps). One line per event
+# with a level, so failures are debuggable and every write is auditable.
+logging.basicConfig(
+    level=os.environ.get("TAG_GOVERNANCE_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+log = logging.getLogger("tag_governance.app")
+
 app = FastAPI(title="Tag Governance")
 
 # Env-configured defaults (same vars the bundle already sets).
@@ -28,7 +38,14 @@ DEFAULT_DAYS = int(os.environ.get("TAG_GOVERNANCE_DAYS", "30"))
 
 
 def _err(e: Exception, status: int = 500) -> JSONResponse:
-    return JSONResponse({"error": str(e)}, status_code=status)
+    """Log the full error server-side with a correlation id; return only a safe,
+    generic message + that id to the client (never leak internals/stack)."""
+    err_id = uuid.uuid4().hex[:12]
+    log.exception("unhandled error [%s]: %s", err_id, e)
+    return JSONResponse(
+        {"error": "Something went wrong. Reference id for support: " + err_id,
+         "error_id": err_id},
+        status_code=status)
 
 
 def _deny(reason: str) -> JSONResponse:
@@ -54,14 +71,18 @@ def _validate_tag(key: str, value: str):
         raise BadInput(f"Invalid tag value {value!r}: allowed chars A-Z a-z 0-9 space +-=._:/@, max 255.")
 
 
-def _gate_live_write(request: Request, dry_run: bool):
+def _gate_live_write(request: Request, dry_run: bool, action: str = "write"):
     """Return a 403 JSONResponse if this LIVE write isn't authorized, else None.
-    Also stamps the requester email so batches record WHO acted. Dry-runs are
-    always allowed (they mutate nothing) but still record the requester."""
-    tagging.set_requester(authz.requester_email(request.headers))
+    Also stamps the requester email so batches record WHO acted, and logs the
+    authorization decision for audit. Dry-runs mutate nothing (always allowed)."""
+    email = authz.requester_email(request.headers) or "unknown"
+    tagging.set_requester(email)
     if dry_run:
+        log.info("action=%s user=%s mode=dry_run", action, email)
         return None
     ok, reason = authz.authorize_write(request.headers)
+    log.info("action=%s user=%s mode=LIVE authorized=%s reason=%s",
+             action, email, ok, reason)
     return None if ok else _deny(reason)
 
 
@@ -124,7 +145,7 @@ def auto_tag(body: AutoTagBody, request: Request):
     """Seamless: enqueue rules (+ optional AI fallback) as one batch, run writer.
 
     use_ai=False → pure rules, no AI-proposed tags (for AI-averse customers)."""
-    denied = _gate_live_write(request, body.dry_run)
+    denied = _gate_live_write(request, body.dry_run, "auto-tag")
     if denied:
         return denied
     try:
@@ -180,7 +201,7 @@ def tag_selected(body: TagSelectedBody, request: Request):
     """Apply tags to ONLY the workloads the user kept checked in the preview.
     Enqueues exactly this list (each with its own value) — unchecked rows are
     never queued — then runs the writer."""
-    denied = _gate_live_write(request, body.dry_run)
+    denied = _gate_live_write(request, body.dry_run, "tag-selected")
     if denied:
         return denied
     try:
@@ -213,7 +234,7 @@ class ManualTagBody(BaseModel):
 @app.post("/api/manual-tag")
 def manual_tag(body: ManualTagBody, request: Request):
     """Tag ONE workload with an explicitly typed value — no AI, no rules."""
-    denied = _gate_live_write(request, body.dry_run)
+    denied = _gate_live_write(request, body.dry_run, "manual-tag")
     if denied:
         return denied
     try:
@@ -279,7 +300,7 @@ class BatchBody(BaseModel):
 
 @app.post("/api/rollback")
 def rollback(body: BatchBody, request: Request):
-    denied = _gate_live_write(request, body.dry_run)
+    denied = _gate_live_write(request, body.dry_run, "rollback")
     if denied:
         return denied
     try:

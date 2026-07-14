@@ -10,8 +10,11 @@ across redeploys without hardcoding job ids.
 """
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
+
+log = logging.getLogger("tag_governance.jobs")
 
 WRITER_JOB = "tag-governance-writer"
 ROLLBACK_JOB = "tag-governance-rollback"
@@ -62,6 +65,7 @@ def run_writer(batch_id: str, dry_run: bool = True) -> dict:
         job_id=job_id,
         job_parameters={"batch_id": batch_id, "dry_run": "true" if dry_run else "false"},
     )
+    log.info("writer triggered batch=%s dry_run=%s run_id=%s", batch_id, dry_run, run.run_id)
     return {"run_id": run.run_id, "url": _run_url(job_id, run.run_id),
             "dry_run": dry_run, "batch_id": batch_id}
 
@@ -74,5 +78,6 @@ def run_rollback(batch_id: str, dry_run: bool = True) -> dict:
         job_id=job_id,
         job_parameters={"batch_id": batch_id, "dry_run": "true" if dry_run else "false"},
     )
+    log.info("rollback triggered batch=%s dry_run=%s run_id=%s", batch_id, dry_run, run.run_id)
     return {"run_id": run.run_id, "url": _run_url(job_id, run.run_id),
             "dry_run": dry_run, "batch_id": batch_id}
