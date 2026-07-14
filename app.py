@@ -1,760 +1,299 @@
-"""Tag Governance — scan untagged Databricks workloads by cost, tag in place.
+"""Tag Governance — seamless auto-tagging for Databricks chargeback.
 
-Solves the chargeback problem: consumption is high but workloads aren't tagged,
-so cost can't be attributed to teams. This app scans system.billing.usage across
-ALL products, ranks untagged workloads by spend, and lets you apply your own
-chargeback tag keys in place (dry-run preview today), then verify.
+A lightweight FastAPI app (no Streamlit, no npm). It shows how much spend is
+untagged, then lets you AUTO-TAG a chargeback key in one action: rules first,
+AI suggestions for the rest, enqueued as one batch and applied by the writer job
+(dry-run by default). Batches are listed and one-click reversible.
+
+The app never mutates a resource itself — it enqueues intent and triggers the
+writer/rollback jobs, which do the safe, audited, resumable writes.
 """
 from __future__ import annotations
 
-import pandas as pd
-import streamlit as st
+import os
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 import db
+import jobs
 import queries
 import tagging
 
-st.set_page_config(
-    page_title="Tag Governance",
-    page_icon="🏷️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+app = FastAPI(title="Tag Governance")
 
-# ----------------------------------------------------------------------------- styling
-st.markdown(
-    """
-    <style>
-      .block-container {padding-top: 2rem; max-width: 1400px;}
-      /* KPI cards — custom, colour-coded by meaning */
-      .kpi {
-        background: linear-gradient(180deg, #1b1f27 0%, #15181f 100%);
-        border: 1px solid #2a2f3a; border-left-width: 5px; border-radius: 14px;
-        padding: 16px 18px; box-shadow: 0 1px 3px rgba(0,0,0,.35); height: 100%;
-      }
-      .kpi .lbl {color:#9aa4b2; font-weight:600; font-size:.82rem; letter-spacing:.03em;
-                 text-transform:uppercase; margin:0 0 6px 0;}
-      .kpi .val {font-size:2.1rem; font-weight:800; line-height:1.1; margin:0;}
-      .kpi .sub {color:#6b7280; font-size:.78rem; margin:4px 0 0 0;}
-      .kpi-neutral {border-left-color:#5b8def;} .kpi-neutral .val {color:#e8eefc;}
-      .kpi-bad     {border-left-color:#ff5b5b;} .kpi-bad .val     {color:#ff6b6b;}
-      .kpi-warn    {border-left-color:#f2b53c;} .kpi-warn .val    {color:#f2c14e;}
-      /* badges */
-      .badge {display:inline-block; padding:2px 10px; border-radius:999px;
-              font-size:.72rem; font-weight:700; letter-spacing:.03em;}
-      .badge-untagged {background:#3a1d1d; color:#ff8585; border:1px solid #5b2b2b;}
-      .badge-srvless  {background:#1d2c3a; color:#7fb6ff; border:1px solid #2b425b;}
-      .hero-sub {color:#9aa4b2; font-size:.95rem; margin-top:-8px;}
-      h1, h2, h3 {letter-spacing:-.01em;}
-      .prod-pill {font-weight:700;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# Env-configured defaults (same vars the bundle already sets).
+DEFAULT_DAYS = int(os.environ.get("TAG_GOVERNANCE_DAYS", "30"))
 
-PRODUCT_LABELS = {
-    "JOBS": "Jobs", "DLT": "SDP / DLT", "SQL": "SQL", "MODEL_SERVING": "Model Serving",
-    "VECTOR_SEARCH": "Vector Search", "ALL_PURPOSE": "All-Purpose", "INTERACTIVE": "Interactive",
-    "APPS": "Apps", "LAKEBASE": "Lakebase", "DATA_QUALITY_MONITORING": "Lakehouse Monitoring",
+
+def _err(e: Exception, status: int = 500) -> JSONResponse:
+    return JSONResponse({"error": str(e)}, status_code=status)
+
+
+# ----------------------------------------------------------------------------- API
+@app.get("/api/overview")
+def overview(days: int = DEFAULT_DAYS, tag_key: str = "cost_center"):
+    """Headline KPIs + untagged spend by product."""
+    try:
+        kpi = db.run_query(queries.kpi_summary(days, [tag_key]))
+        products = db.run_query(queries.by_product(days, [tag_key]))
+        return {"days": days, "tag_key": tag_key,
+                "kpi": kpi[0] if kpi else {}, "products": products}
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+@app.get("/api/preview")
+def preview(days: int = DEFAULT_DAYS, tag_key: str = "cost_center",
+            min_confidence: float = 0.8):
+    """What auto-tag WOULD do from AI suggestions (impact + value breakdown)."""
+    try:
+        impact = db.run_query(queries.suggestions_bulk_impact(tag_key, min_confidence, days))
+        breakdown = db.run_query(
+            queries.suggestions_bulk_breakdown(tag_key, min_confidence, days, limit=25))
+        return {"impact": impact[0] if impact else {}, "breakdown": breakdown}
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+class AutoTagBody(BaseModel):
+    tag_key: str = "cost_center"
+    days: int = DEFAULT_DAYS
+    min_confidence: float = 0.8
+    rules: list | None = None
+    dry_run: bool = True
+
+
+@app.post("/api/auto-tag")
+def auto_tag(body: AutoTagBody):
+    """Seamless: enqueue rules + AI fallback as one batch, then run the writer."""
+    try:
+        result = tagging.auto_tag(
+            tag_key=body.tag_key, days=body.days, rules=body.rules,
+            min_confidence=body.min_confidence,
+        )
+        if result.get("total_rows", 0) == 0:
+            return {**result, "run": None,
+                    "message": "Nothing matched — no rules hit and no confident "
+                               "suggestions at this cutoff."}
+        run = jobs.run_writer(result["batch_id"], dry_run=body.dry_run)
+        return {**result, "run": run}
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+@app.get("/api/batches")
+def batches(limit: int = 25):
+    try:
+        return {"batches": db.run_query(queries.recent_batches(limit))}
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+class BatchBody(BaseModel):
+    batch_id: str
+    dry_run: bool = True
+
+
+@app.post("/api/rollback")
+def rollback(body: BatchBody):
+    try:
+        return {"run": jobs.run_rollback(body.batch_id, dry_run=body.dry_run)}
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+# ----------------------------------------------------------------------------- UI
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(INDEX_HTML)
+
+
+INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tag Governance</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:#0e1117; color:#e8eefc; }
+  header { padding:22px 28px; border-bottom:1px solid #222836;
+           display:flex; align-items:baseline; gap:14px; }
+  header h1 { margin:0; font-size:1.4rem; letter-spacing:-.01em; }
+  header .sub { color:#8b95a7; font-size:.9rem; }
+  main { max-width:1080px; margin:0 auto; padding:26px 28px 60px; }
+  section { margin-bottom:34px; }
+  h2 { font-size:1.05rem; color:#cbd5e6; border-bottom:1px solid #1e2430;
+       padding-bottom:8px; }
+  .kpis { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+  .kpi { background:#161b24; border:1px solid #232b39; border-left:4px solid #5b8def;
+         border-radius:12px; padding:16px 18px; }
+  .kpi.bad { border-left-color:#ff5b5b; } .kpi.warn { border-left-color:#f2b53c; }
+  .kpi .lbl { color:#8b95a7; font-size:.74rem; text-transform:uppercase;
+              letter-spacing:.04em; }
+  .kpi .val { font-size:1.9rem; font-weight:800; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid #1c2330; }
+  th { color:#8b95a7; font-weight:600; font-size:.78rem; text-transform:uppercase; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .card { background:#141922; border:1px solid #222a38; border-radius:12px; padding:18px 20px; }
+  label { display:block; font-size:.82rem; color:#a9b3c4; margin:12px 0 4px; }
+  input,select { background:#0e1117; color:#e8eefc; border:1px solid #2a3342;
+                 border-radius:8px; padding:8px 10px; font:inherit; width:220px; }
+  .row { display:flex; gap:22px; flex-wrap:wrap; align-items:flex-end; }
+  button { background:#3b6fe0; color:#fff; border:0; border-radius:9px;
+           padding:10px 18px; font:inherit; font-weight:600; cursor:pointer; margin-top:16px; }
+  button.ghost { background:#222b3a; }
+  button:disabled { opacity:.5; cursor:default; }
+  .toggle { display:flex; align-items:center; gap:8px; margin-top:16px; font-size:.88rem; }
+  .note { color:#8b95a7; font-size:.85rem; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:.72rem;
+          font-weight:700; background:#1d2c3a; color:#7fb6ff; }
+  .ok { color:#5fd08a; } .muted { color:#6b7280; }
+  a { color:#7fb6ff; }
+  #result { margin-top:16px; }
+  .banner { border-radius:10px; padding:12px 14px; margin-top:14px; font-size:.9rem; }
+  .banner.info { background:#132030; border:1px solid #244055; }
+  .banner.warn { background:#2a2410; border:1px solid #5b4b1e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🏷️ Tag Governance</h1>
+  <span class="sub">Find untagged spend. Attribute it to teams — automatically.</span>
+</header>
+<main>
+
+  <section>
+    <div class="row">
+      <div><label>Tag key</label><input id="tagKey" value="cost_center"></div>
+      <div><label>Lookback (days)</label>
+        <select id="days"><option>7</option><option>14</option>
+          <option selected>30</option><option>60</option><option>90</option></select></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Untagged spend</h2>
+    <div class="kpis" id="kpis"><div class="muted">Loading…</div></div>
+    <div style="margin-top:16px"><table id="products"></table></div>
+  </section>
+
+  <section>
+    <h2>Auto-tag</h2>
+    <div class="card">
+      <p class="note">Rules run first; the AI fills in the rest above the confidence
+         cutoff. Everything goes into <b>one batch</b> the writer job applies — reversible
+         in one click below.</p>
+      <div class="row">
+        <div><label>AI confidence cutoff</label>
+          <select id="conf"><option>0.6</option><option>0.7</option>
+            <option selected>0.8</option><option>0.9</option></select></div>
+        <button class="ghost" onclick="doPreview()">Preview impact</button>
+      </div>
+      <div id="previewBox"></div>
+      <div class="toggle">
+        <input type="checkbox" id="dryRun" checked>
+        <label for="dryRun" style="margin:0">Dry run (logs intended changes, writes nothing)</label>
+      </div>
+      <button id="goBtn" onclick="doAutoTag()">Auto-tag now</button>
+      <div id="result"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Batches &amp; rollback</h2>
+    <table id="batches"></table>
+  </section>
+
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const money = v => v==null ? "—" : (Math.abs(v)>=1e6 ? "$"+(v/1e6).toFixed(1)+"M"
+                    : Math.abs(v)>=1e3 ? "$"+(v/1e3).toFixed(1)+"K" : "$"+Math.round(v));
+const q = () => "?days="+$("#days").value+"&tag_key="+encodeURIComponent($("#tagKey").value);
+
+async function loadOverview(){
+  const r = await (await fetch("/api/overview"+q())).json();
+  if(r.error){ $("#kpis").innerHTML = '<div class="banner warn">'+r.error+'</div>'; return; }
+  const k = r.kpi||{};
+  $("#kpis").innerHTML =
+    kpi("Untagged spend", money(k.untagged_cost), "bad") +
+    kpi("% untagged", (k.pct_untagged??"—")+"%", "warn") +
+    kpi("Untagged workloads", (k.untagged_workloads??"—").toLocaleString(), "");
+  let t = "<tr><th>Product</th><th class=num>Untagged</th><th class=num>Total</th><th class=num>% untagged</th></tr>";
+  for(const p of (r.products||[]))
+    t += `<tr><td>${p.product}</td><td class=num>${money(p.untagged_cost)}</td>`+
+         `<td class=num>${money(p.total_cost)}</td><td class=num>${p.pct_untagged}%</td></tr>`;
+  $("#products").innerHTML = t;
+}
+const kpi = (l,v,c)=>`<div class="kpi ${c}"><div class=lbl>${l}</div><div class=val>${v}</div></div>`;
+
+async function doPreview(){
+  $("#previewBox").innerHTML = '<div class="note">Computing…</div>';
+  const u = "/api/preview"+q()+"&min_confidence="+$("#conf").value;
+  const r = await (await fetch(u)).json();
+  if(r.error){ $("#previewBox").innerHTML='<div class="banner warn">'+r.error+'</div>'; return; }
+  const i = r.impact||{};
+  let html = `<div class="banner info">AI would tag <b>${(i.workloads||0).toLocaleString()}</b> `+
+             `workloads (<b>${money(i.cost)}</b>) across ${i.distinct_values||0} values.</div>`;
+  if((r.breakdown||[]).length){
+    html += "<table><tr><th>Value</th><th class=num>Workloads</th><th class=num>Cost</th><th class=num>Min conf</th></tr>";
+    for(const b of r.breakdown)
+      html += `<tr><td>${b.value}</td><td class=num>${b.workloads}</td>`+
+              `<td class=num>${money(b.cost)}</td><td class=num>${b.min_conf}</td></tr>`;
+    html += "</table>";
+  }
+  $("#previewBox").innerHTML = html;
 }
 
+async function doAutoTag(){
+  $("#goBtn").disabled = true;
+  $("#result").innerHTML = '<div class="note">Enqueuing + starting writer…</div>';
+  const body = { tag_key:$("#tagKey").value, days:+$("#days").value,
+                 min_confidence:+$("#conf").value, dry_run:$("#dryRun").checked };
+  const r = await (await fetch("/api/auto-tag",{method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)})).json();
+  $("#goBtn").disabled = false;
+  if(r.error){ $("#result").innerHTML='<div class="banner warn">'+r.error+'</div>'; return; }
+  if(!r.run){ $("#result").innerHTML='<div class="banner warn">'+(r.message||"Nothing to do")+'</div>'; return; }
+  const mode = r.run.dry_run ? "<b>dry-run</b> (nothing written)" : "<b>LIVE</b>";
+  $("#result").innerHTML =
+    `<div class="banner info">Batch <span class=pill>${r.batch_id}</span> — `+
+    `${r.rule_rows} by rules, ${r.ai_rows} by AI. `+
+    `Writer started in ${mode}: <a href="${r.run.url}" target=_blank>view run →</a></div>`;
+  loadBatches();
+}
 
-def fmt_money(v) -> str:
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        return "—"
-    if v >= 1_000_000:
-        return f"${v/1_000_000:.1f}M"
-    if v >= 1_000:
-        return f"${v/1_000:.1f}K"
-    return f"${v:,.0f}"
+async function loadBatches(){
+  const r = await (await fetch("/api/batches?limit=15")).json();
+  if(r.error){ $("#batches").innerHTML=""; return; }
+  let t = "<tr><th>Batch</th><th class=num>Rows</th><th class=num>Cost</th>"+
+          "<th class=num>Pending</th><th class=num>Done</th><th class=num>Failed</th><th></th></tr>";
+  for(const b of (r.batches||[])){
+    t += `<tr><td><span class=pill>${b.batch_id}</span></td>`+
+         `<td class=num>${b.rows}</td><td class=num>${money(b.cost)}</td>`+
+         `<td class=num>${b.pending}</td><td class=num class=ok>${b.succeeded}</td>`+
+         `<td class=num>${b.failed}</td>`+
+         `<td><button class=ghost style="margin:0;padding:5px 12px" `+
+         `onclick="doRollback('${b.batch_id}')">Rollback</button></td></tr>`;
+  }
+  $("#batches").innerHTML = t;
+}
 
+async function doRollback(id){
+  if(!confirm("Roll back "+id+"? (starts as dry-run)")) return;
+  const r = await (await fetch("/api/rollback",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({batch_id:id, dry_run:true})})).json();
+  if(r.error){ alert(r.error); return; }
+  alert("Rollback started (dry-run): "+r.run.url);
+}
 
-def show_run_writer_next(batch_id: str):
-    """After an enqueue, spell out the REQUIRED next step. The app only queues —
-    a batch sits PENDING until the writer job is run. Make that impossible to miss."""
-    st.warning(
-        "⏸️ **Queued — not applied yet.** The app only *queues* changes; this batch "
-        "stays **PENDING** until you run the **writer job**. Nothing is tagged until then.",
-        icon="⏸️",
-    )
-    with st.expander("▶️ How to apply this batch (run the writer)", expanded=True):
-        st.markdown("Run these from a terminal, safest first — or use the Jobs UI "
-                    "(**tag-governance-writer → Run now** with the same parameters):")
-        st.code(
-            f"# 1. Smoke test — proves reachability, writes nothing\n"
-            f"databricks bundle run tag-governance-writer -- \\\n"
-            f"  --python-params smoke_test=true batch_id={batch_id}\n\n"
-            f"# 2. Dry run — logs intended old→new, still writes nothing\n"
-            f"databricks bundle run tag-governance-writer -- \\\n"
-            f"  --python-params dry_run=true batch_id={batch_id}\n\n"
-            f"# 3. Apply for real (home workspace in M1)\n"
-            f"databricks bundle run tag-governance-writer -- \\\n"
-            f"  --python-params dry_run=false batch_id={batch_id}",
-            language="bash",
-        )
-        st.caption("Track status any time in the **📬 Batches & Rollback** view.")
-
-
-# ----------------------------------------------------------------------------- sidebar
-st.sidebar.title("🏷️ Tag Governance")
-st.sidebar.caption("Find untagged spend. Attribute it to teams.")
-
-days = st.sidebar.select_slider(
-    "Lookback window", options=[7, 14, 30, 60, 90], value=30,
-    help="Days of system.billing.usage to scan.",
-)
-
-# Workspace picker — billing is account-wide, so this slices the same data by
-# workspace_id (no per-workspace login needed). Empty selection = all workspaces.
-st.sidebar.subheader("Workspaces")
-ws_label_to_id = {}
-try:
-    ws_df = db.run_query(queries.workspace_options(days))
-    for _, r in ws_df.iterrows():
-        ws_label_to_id[f"{r['workspace_name']}  ({fmt_money(r['cost'])})"] = str(r["workspace_id"])
-except Exception:
-    ws_df = None
-ws_picked_labels = st.sidebar.multiselect(
-    "Filter to workspaces", options=list(ws_label_to_id.keys()),
-    default=[], help="Leave empty to scan ALL workspaces in the account.",
-)
-workspaces = [ws_label_to_id[l] for l in ws_picked_labels] or None
-# id -> friendly name, for labelling tables elsewhere
-WS_NAMES = {}
-if ws_df is not None:
-    for _, r in ws_df.iterrows():
-        WS_NAMES[str(r["workspace_id"])] = r["workspace_name"]
-st.sidebar.caption(
-    f"Scanning **all {len(ws_label_to_id)} workspaces**" if not workspaces
-    else f"Scanning **{len(workspaces)}** of {len(ws_label_to_id)} workspaces"
-)
-
-# Seed the key picker from tags actually in use, but let users add their own.
-try:
-    existing_keys_df = db.run_query(queries.distinct_tag_keys(days, workspaces))
-    existing_keys = existing_keys_df["tag_key"].tolist()
-except Exception:
-    existing_keys = []
-
-DEFAULT_SUGGESTED = ["cost_center", "team", "business_unit", "project", "environment"]
-suggested = DEFAULT_SUGGESTED + [k for k in existing_keys if k not in DEFAULT_SUGGESTED]
-
-st.sidebar.subheader("Your chargeback keys")
-st.sidebar.caption("A workload counts as **untagged** if it's missing *these* keys. Pick or type your own.")
-tag_keys = st.sidebar.multiselect(
-    "Required tag keys", options=suggested, default=["cost_center", "team"],
-    help="These are the keys Bayada wants on every workload for chargeback.",
-)
-st.sidebar.info(
-    "🔒 **Safe by design** — the app only *queues* tag changes. A separate "
-    "**writer job** applies them (dry-run by default), records every change to an "
-    "audit log, and supports rollback."
-)
-
-# ----------------------------------------------------------------------------- header
-st.title("Untagged Consumption Scanner")
-
-# First query of a session may wake a stopped serverless warehouse (~1-2 min,
-# one-time); everything after is sub-second on the pre-aggregated table. Tell the
-# user so a cold start doesn't read as "the app is slow / broken".
-if "warmed" not in st.session_state:
-    st.info("⏳ **Warming up** — the first scan may take a minute while the SQL "
-            "warehouse starts. After that, scans are near-instant for the session.")
-
-# Freshness of the pre-aggregated summary table (data is materialized daily, so
-# the app loads instantly rather than scanning raw billing on every open). This
-# first query is also what wakes the warehouse.
-as_of_txt = ""
-try:
-    fr = db.run_query(queries.freshness())
-    if not fr.empty and fr.iloc[0]["as_of"] is not None:
-        as_of_txt = f" · data as of <b>{fr.iloc[0]['as_of']}</b>"
-except Exception:
-    pass
-finally:
-    # Mark warmed even if the query failed — the warehouse is awake either way, so
-    # the "warming up" banner shouldn't linger forever on a transient query error.
-    st.session_state["warmed"] = True
-
-st.markdown(
-    f"<p class='hero-sub'>Last <b>{days} days</b> across every billing product · "
-    f"untagged = missing {', '.join(f'<code>{k}</code>' for k in tag_keys) or '<i>any tag</i>'}"
-    f"{as_of_txt}</p>",
-    unsafe_allow_html=True,
-)
-
-# ----------------------------------------------------------------------------- KPIs
-kpi = db.run_query(queries.kpi_summary(days, tag_keys, workspaces))
-row = kpi.iloc[0] if not kpi.empty else pd.Series(dtype="float64")
-
-def kpi_card(col, label, value, tone, sub=""):
-    col.markdown(
-        f"<div class='kpi kpi-{tone}'><p class='lbl'>{label}</p>"
-        f"<p class='val'>{value}</p>"
-        + (f"<p class='sub'>{sub}</p>" if sub else "")
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-
-pct = row.get("pct_untagged")
-nwk = row.get("untagged_workloads")
-c1, c2, c3, c4 = st.columns(4)
-kpi_card(c1, "💰 Total spend (scanned)", fmt_money(row.get("total_cost")),
-         "neutral", "list price · all products")
-kpi_card(c2, "🚩 Untagged spend", fmt_money(row.get("untagged_cost")),
-         "bad", "can't be charged back")
-kpi_card(c3, "🚩 % untagged", f"{pct:.0f}%" if pd.notna(pct) else "—",
-         "bad", "of total spend")
-kpi_card(c4, "📦 Untagged workloads", f"{int(nwk):,}" if pd.notna(nwk) else "—",
-         "warn", "need a tag")
-
-st.divider()
-
-# View switcher (NOT st.tabs): st.tabs runs EVERY tab's body on every rerun, which
-# fired ~8 warehouse queries per load. A radio renders only the selected view, so
-# each interaction runs just that view's queries — big cold-start win.
-VIEWS = ["📊  Scan", "🏷️  Tag & Verify", "⚡  Bulk tag (rules)",
-         "🤖  Bulk tag (AI)", "📬  Batches & Rollback", "ℹ️  How it works"]
-view = st.radio("View", VIEWS, horizontal=True, label_visibility="collapsed")
-
-# ============================================================================= SCAN
-if view == VIEWS[0]:  # Scan
-    left, right = st.columns([1, 1])
-
-    prod = db.run_query(queries.by_product(days, tag_keys, workspaces))
-    if not prod.empty:
-        prod["Product"] = prod["product"].map(lambda p: PRODUCT_LABELS.get(p, p))
-        with left:
-            st.subheader("Untagged spend by product")
-            chart_df = prod.set_index("Product")[["untagged_cost", "tagged_cost"]]
-            chart_df.columns = ["Untagged", "Tagged"]
-            # red = untagged (the problem), green = tagged (attributed)
-            st.bar_chart(chart_df, color=["#ff6b6b", "#2ecc71"], height=360)
-        with right:
-            st.subheader("Where the gaps are")
-            show = prod[["Product", "total_cost", "untagged_cost", "pct_untagged"]].copy()
-            show.columns = ["Product", "Total $", "Untagged $", "% Untagged"]
-            st.dataframe(
-                show, hide_index=True, height=360, use_container_width=True,
-                column_config={
-                    "Total $": st.column_config.NumberColumn(format="$%d"),
-                    "Untagged $": st.column_config.NumberColumn(format="$%d"),
-                    "% Untagged": st.column_config.ProgressColumn(
-                        format="%.0f%%", min_value=0, max_value=100),
-                },
-            )
-
-    # ---- by workspace ------------------------------------------------------
-    wsdf = db.run_query(queries.by_workspace(days, tag_keys, workspaces))
-    if not wsdf.empty and len(wsdf) > 1:
-        st.subheader("Untagged spend by workspace")
-        st.caption("Which workspaces carry the most unattributable spend.")
-        wl, wr = st.columns([1, 1])
-        with wl:
-            ws_chart = wsdf.set_index("workspace_name")[["untagged_cost"]]
-            ws_chart.columns = ["Untagged $"]
-            st.bar_chart(ws_chart, color="#ff6b6b", height=320, horizontal=True)
-        with wr:
-            wshow = wsdf[["workspace_name", "total_cost", "untagged_cost",
-                          "pct_untagged", "untagged_workloads"]].copy()
-            wshow.columns = ["Workspace", "Total $", "Untagged $", "% Untagged", "# Untagged"]
-            st.dataframe(
-                wshow, hide_index=True, height=320, use_container_width=True,
-                column_config={
-                    "Total $": st.column_config.NumberColumn(format="$%d"),
-                    "Untagged $": st.column_config.NumberColumn(format="$%d"),
-                    "% Untagged": st.column_config.ProgressColumn(
-                        format="%.0f%%", min_value=0, max_value=100),
-                },
-            )
-
-    st.subheader("Untagged workloads — ranked by cost")
-    st.caption("The money you can't charge back yet. Tackle the top of this list first. "
-               "The 🤖 column is an **advisory** AI suggestion — a hint, not an action.")
-    # suggestions_join LEFT JOINs the advisory ai_query hints; falls back to the
-    # plain leaderboard if the suggestions table isn't built yet.
-    try:
-        lb = db.run_query(queries.suggestions_join(days, tag_keys, workspaces))
-    except Exception:
-        lb = db.run_query(queries.leaderboard(days, tag_keys, workspaces))
-    if lb.empty:
-        st.success("🎉 No untagged workloads found for these keys in this window.")
-    else:
-        disp = lb.copy()
-        disp["Product"] = disp["product"].map(lambda p: PRODUCT_LABELS.get(p, p))
-        disp["Workspace"] = disp["workspace_id"].astype(str).map(lambda w: WS_NAMES.get(w, w))
-        disp["Workload"] = disp["workload_name"].fillna(disp["workload_id"])
-        disp["Owner"] = disp["owner"].fillna("— unknown —")
-        disp["Serverless"] = disp["is_serverless"].map({1: "✓", 0: ""})
-        # Advisory AI hint: "slug (conf)" when confidence is meaningful, else blank.
-        if "suggested_cost_center" in disp.columns:
-            def _hint(r):
-                cc = r.get("suggested_cost_center")
-                cf = r.get("confidence")
-                if not cc or (isinstance(cc, float)) or cc == "unknown" or pd.isna(cf):
-                    return ""
-                return f"{cc} ({float(cf):.0%})"
-            disp["🤖 Suggested"] = disp.apply(_hint, axis=1)
-        else:
-            disp["🤖 Suggested"] = ""
-        disp = disp[["Product", "Workspace", "Workload", "Owner", "Serverless",
-                     "🤖 Suggested", "untagged_cost", "workload_id"]]
-        disp.columns = ["Product", "Workspace", "Workload", "Suggested owner", "Srvless",
-                        "🤖 Suggested", "Untagged $", "workload_id"]
-        st.dataframe(
-            disp, hide_index=True, use_container_width=True, height=460,
-            column_config={
-                "Untagged $": st.column_config.NumberColumn(format="$%d"),
-                "workload_id": None,  # hidden, used by Tag tab
-            },
-        )
-        st.session_state["leaderboard"] = lb
-
-# ============================================================================= TAG
-elif view == VIEWS[1]:  # Tag & Verify
-    lb = st.session_state.get("leaderboard")
-    if lb is None or lb.empty:
-        st.info("Run a scan first — then pick a workload here to tag it.")
-    else:
-        lb = lb.copy()
-        lb["label"] = (
-            lb["product"].map(lambda p: PRODUCT_LABELS.get(p, p)) + " · "
-            + lb["workload_name"].fillna(lb["workload_id"]).astype(str)
-            + "  (" + lb["untagged_cost"].map(fmt_money) + ")"
-        )
-        pick = st.selectbox("Pick an untagged workload", lb["label"].tolist())
-        sel = lb[lb["label"] == pick].iloc[0]
-
-        meta_l, meta_r = st.columns([2, 1])
-        with meta_l:
-            st.markdown(f"### {sel['workload_name'] or sel['workload_id']}")
-            st.markdown(
-                f"<span class='badge badge-untagged'>UNTAGGED</span>&nbsp;"
-                + (f"<span class='badge badge-srvless'>SERVERLESS</span>"
-                   if sel["is_serverless"] == 1 else ""),
-                unsafe_allow_html=True,
-            )
-            st.caption(f"`{sel['workload_id']}` · {PRODUCT_LABELS.get(sel['product'], sel['product'])}")
-        with meta_r:
-            st.metric("Untagged cost", fmt_money(sel["untagged_cost"]))
-
-        # approvals recorded this session, keyed by workload_id
-        approvals = st.session_state.setdefault("approvals", {})
-        wid = sel["workload_id"]
-        already = approvals.get(wid)
-
-        st.markdown("#### Assign chargeback tags")
-        if already:
-            st.success(f"✅ **Queued** — tags { already['tags'] } (batch `{already.get('batch_id','?')}`).")
-            if already.get("batch_id"):
-                show_run_writer_next(already["batch_id"])
-
-        if not tag_keys:
-            st.warning("Choose your chargeback keys in the sidebar first.")
-        else:
-            with st.form("tagform"):
-                suggested_owner = sel["owner"] if pd.notna(sel["owner"]) else ""
-                values = {}
-                cols = st.columns(min(len(tag_keys), 3))
-                for i, k in enumerate(tag_keys):
-                    default = suggested_owner if k in ("team", "owner") else ""
-                    values[k] = cols[i % len(cols)].text_input(
-                        k, value=default, placeholder=f"value for {k}")
-                submitted = st.form_submit_button("1 · Preview tag change", type="primary")
-
-            if submitted:
-                tags = {k: v for k, v in values.items() if v.strip()}
-                if not tags:
-                    st.error("Enter at least one tag value.")
-                else:
-                    # stash the previewed plan so the Approve button (outside the
-                    # form) can act on it without re-running the form
-                    st.session_state["pending_plan"] = {
-                        "product": sel["product"], "workload_id": wid,
-                        "workload_name": sel["workload_name"] or wid,
-                        "tags": tags, "is_serverless": int(sel["is_serverless"] == 1),
-                    }
-
-            pend = st.session_state.get("pending_plan")
-            if pend and pend["workload_id"] == wid:
-                plan = tagging.plan_for(
-                    product=pend["product"], workload_id=pend["workload_id"],
-                    workload_name=pend["workload_name"], tags=pend["tags"],
-                    is_serverless=bool(pend["is_serverless"]),
-                )
-                tagging.preview(plan)
-                st.markdown("---")
-                st.markdown(f"**Preview · {plan.resource_type}**")
-                cc1, cc2 = st.columns(2)
-                with cc1:
-                    st.markdown("**Tags to queue**")
-                    st.json(pend["tags"])
-                with cc2:
-                    st.markdown("**API the writer will call**")
-                    st.code(plan.api_hint, language="python")
-                for w in plan.warnings:
-                    st.warning(w)
-
-                # ---- enqueue step ------------------------------------------
-                st.info("📬 Queuing records the change into the write queue. It is applied "
-                        "by the **writer job** (dry-run by default), which logs every "
-                        "change to the audit table and supports rollback.")
-                if not plan.supported:
-                    st.error(plan.warnings[0] if plan.warnings else "Unsupported product.")
-                elif st.button("2 · Queue tag change", type="primary", key=f"approve_{wid}"):
-                    res = tagging.approve(
-                        plan, workspace_id=str(sel["workspace_id"]),
-                        is_serverless=bool(sel["is_serverless"] == 1),
-                        list_cost=float(sel["untagged_cost"]))
-                    approvals[wid] = {
-                        "tags": pend["tags"], "product": pend["product"],
-                        "workload_name": pend["workload_name"],
-                        "status": res["status"], "batch_id": res.get("batch_id"),
-                        "cost": float(sel["untagged_cost"]),
-                    }
-                    st.session_state.pop("pending_plan", None)
-                    st.rerun()
-
-                # status lifecycle
-                st.markdown("**Status**")
-                done = "🟢" if already else "⚪"
-                st.markdown(
-                    f"🔴 Untagged &nbsp;→&nbsp; 🟡 Previewed &nbsp;→&nbsp; {done} "
-                    f"{'**Queued**' if already else 'Queued'} &nbsp;→&nbsp; "
-                    f"⚪ Writer applies &nbsp;→&nbsp; ⚪ Reflected in billing"
-                )
-                st.caption(
-                    "Queuing never touches the resource. The writer job applies the tag "
-                    "(immediately on the resource), and it appears in system.billing.usage "
-                    "on **future** usage (billing tables lag ~hours)."
-                )
-
-        # ---- queued this session ----------------------------------------------
-        if approvals:
-            st.markdown("---")
-            st.markdown(f"#### Queued this session ({len(approvals)})")
-            q = pd.DataFrame([
-                {"Workload": v["workload_name"],
-                 "Product": PRODUCT_LABELS.get(v["product"], v["product"]),
-                 "Tags": ", ".join(f"{k}={val}" for k, val in v["tags"].items()),
-                 "Cost attributed": fmt_money(v["cost"]),
-                 "Batch": v.get("batch_id", "—"),
-                 "Status": "Queued"}
-                for v in approvals.values()
-            ])
-            st.dataframe(q, hide_index=True, use_container_width=True)
-            attributed = sum(v["cost"] for v in approvals.values())
-            st.metric("Spend queued for attribution", fmt_money(attributed))
-            st.caption("Track and apply these in the **Batches & Rollback** tab.")
-
-# ============================================================================= BULK
-elif view == VIEWS[2]:  # Bulk tag (rules)
-    st.subheader("Tag thousands of workloads with a few rules")
-    st.caption("Each rule attributes every matching workload at once. Earlier rules "
-               "win on conflict. Preview the full impact before applying — nothing "
-               "is mutated in dry-run.")
-
-    if not tag_keys:
-        st.warning("Choose your chargeback keys in the sidebar first.")
-    else:
-        st.caption("Rules are evaluated **in the warehouse** — the app never pulls the "
-                   "full workload set, so this scales to tens of thousands of workloads.")
-
-        n_rules = st.number_input("How many rules?", 1, 20, 3, key="n_rules")
-        st.markdown("##### Rules")
-        st.caption("Match field · operator · value  →  tags to assign "
-                   "(format `key=value`, comma-separated).")
-
-        rules = []
-        for i in range(int(n_rules)):
-            c0, c1, c2, c3 = st.columns([1.1, 1, 1.6, 2.3])
-            field = c0.selectbox("Field", list(tagging.RULE_FIELDS.keys()),
-                                 key=f"f{i}", label_visibility="collapsed")
-            op = c1.selectbox("Op", tagging.RULE_OPS, key=f"o{i}",
-                              label_visibility="collapsed")
-            value = c2.text_input("Value", key=f"v{i}", label_visibility="collapsed",
-                                  placeholder="e.g. data-eng@bayada.com")
-            tagstr = c3.text_input("Tags", key=f"t{i}", label_visibility="collapsed",
-                                   placeholder="team=data-eng, cost_center=BI")
-            tags = {}
-            for pair in tagstr.split(","):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    if k.strip() and v.strip():
-                        tags[k.strip()] = v.strip()
-            rules.append({"field": field, "op": op, "value": value.strip(), "tags": tags})
-
-        valid_rules = [r for r in rules if r["value"] and r["tags"]]
-        if st.button("Preview impact", type="primary", disabled=not valid_rules):
-            st.session_state["bulk_rules"] = valid_rules
-
-        rset = st.session_state.get("bulk_rules")
-        if rset:
-            # all evaluated in SQL — only aggregates + a 50-row sample come back
-            impact = db.run_query(queries.bulk_rule_impact(days, tag_keys, rset, workspaces))
-            perrule = db.run_query(queries.bulk_rule_per_rule(days, tag_keys, rset, workspaces))
-            sample = db.run_query(queries.bulk_rule_sample(days, tag_keys, rset, workspaces))
-
-            irow = impact.iloc[0] if not impact.empty else pd.Series(dtype="float64")
-            total_unt = float(irow.get("total_untagged_cost") or 0)
-            matched_cnt = int(irow.get("matched_count") or 0)
-            matched_cost = float(irow.get("matched_cost") or 0)
-
-            st.markdown("---")
-            m1, m2, m3 = st.columns(3)
-            kpi_card(m1, "Workloads matched", f"{matched_cnt:,}", "neutral",
-                     f"of {int(irow.get('total_untagged') or 0):,} untagged")
-            kpi_card(m2, "Spend now attributable", fmt_money(matched_cost), "warn",
-                     f"{100*matched_cost/total_unt:.0f}% of untagged" if total_unt else "")
-            kpi_card(m3, "Avg $/workload",
-                     fmt_money(matched_cost / matched_cnt) if matched_cnt else "—",
-                     "neutral", "matched")
-
-            # per-rule coverage (first-match)
-            st.markdown("**Coverage by rule** (first matching rule wins)")
-            pr_map = {int(r["first_rule"]): r for _, r in perrule.iterrows()} \
-                if not perrule.empty else {}
-            cov = pd.DataFrame([
-                {"Rule": f"{i+1}. {r['field']} {r['op']} '{r['value']}'",
-                 "Assigns": ", ".join(f"{k}={v}" for k, v in r["tags"].items()),
-                 "Workloads": int(pr_map.get(i, {}).get("workloads", 0)),
-                 "Cost": fmt_money(pr_map.get(i, {}).get("cost", 0))}
-                for i, r in enumerate(rset)
-            ])
-            st.dataframe(cov, hide_index=True, use_container_width=True)
-
-            # sample
-            st.markdown("**Sample of matched workloads** (top 50 by cost)")
-            if not sample.empty:
-                disp = sample.copy()
-                disp["Product"] = disp["product"].map(lambda p: PRODUCT_LABELS.get(p, p))
-                disp["Workload"] = disp["workload_name"].fillna("—")
-                disp["Owner"] = disp["owner"].fillna("— unknown —")
-                disp["Will get tags"] = disp["first_rule"].map(
-                    lambda i: ", ".join(f"{k}={v}" for k, v in rset[int(i)]["tags"].items())
-                    if 0 <= int(i) < len(rset) else "")
-                disp["Cost"] = disp["cost"].map(fmt_money)
-                st.dataframe(disp[["Product", "Workload", "Owner", "Will get tags", "Cost"]],
-                             hide_index=True, use_container_width=True, height=380)
-
-            # enqueue
-            st.markdown("---")
-            st.info("📬 Queuing writes one row per (workload, tag) into the write queue — "
-                    "**in the warehouse**, so tens of thousands of workloads never round-trip "
-                    "through the app. The **writer job** then applies them (dry-run by default), "
-                    "cost-descending and per-workspace, logging every change for rollback.")
-            if st.button(f"Queue {matched_cnt:,} workloads for tagging",
-                         type="primary", disabled=matched_cnt == 0):
-                res = tagging.enqueue_bulk(days, tag_keys, rset, workspaces)
-                if res.get("status") == "ENQUEUED":
-                    rows = res.get("rows")
-                    rows = rows if rows is not None else matched_cnt  # driver may not report rowcount
-                    st.success(f"✅ Queued batch `{res['batch_id']}` — {rows:,} "
-                               f"queue rows, {fmt_money(matched_cost)} now attributable once applied.")
-                    show_run_writer_next(res["batch_id"])
-                else:
-                    st.warning(res.get("message", "Nothing to queue."))
-
-# ============================================================================= BULK (AI)
-elif view == VIEWS[3]:  # Bulk tag (AI)
-    st.subheader("Tag thousands of workloads from AI suggestions")
-    st.caption("The 🤖 classifier already proposed a cost-center for each workload. "
-               "Pick the tag key and a confidence cutoff, review the impact, and queue "
-               "them all in one click — no typing thousands of values. A human still "
-               "gates the batch; the writer job applies it (dry-run by default).")
-
-    if not tag_keys:
-        st.warning("Choose your chargeback keys in the sidebar first.")
-    else:
-        ccol1, ccol2 = st.columns([1.4, 1])
-        tag_key = ccol1.selectbox(
-            "Tag key to assign", tag_keys,
-            help="The AI's suggested value goes into THIS key on each workload.")
-        min_conf = ccol2.slider("Min confidence", 0.0, 1.0, 0.8, 0.05,
-                                help="Only enqueue suggestions the model is at least this confident about.")
-
-        impact = db.run_query(queries.suggestions_bulk_impact(tag_key, min_conf, days, workspaces))
-        irow = impact.iloc[0] if not impact.empty else pd.Series(dtype="float64")
-        n = int(irow.get("workloads") or 0)
-        cost = float(irow.get("cost") or 0)
-        distinct = int(irow.get("distinct_values") or 0)
-
-        st.markdown("---")
-        m1, m2, m3 = st.columns(3)
-        kpi_card(m1, "Workloads to tag", f"{n:,}", "neutral",
-                 f"confidence ≥ {min_conf:.2f}")
-        kpi_card(m2, "Spend now attributable", fmt_money(cost), "warn",
-                 "from AI suggestions")
-        kpi_card(m3, "Distinct values", f"{distinct}", "neutral", "the AI proposed")
-
-        if n == 0:
-            st.info("No suggestions meet this confidence cutoff. Lower the threshold, "
-                    "or (re)run the annotate job to refresh suggestions.")
-        else:
-            st.markdown(f"**What would be assigned to `{tag_key}`** (by suggested value)")
-            bd = db.run_query(queries.suggestions_bulk_breakdown(tag_key, min_conf, days, workspaces))
-            if not bd.empty:
-                disp = bd.copy()
-                disp["Cost"] = disp["cost"].map(fmt_money)
-                disp["Min conf"] = disp["min_conf"].map(lambda c: f"{float(c):.0%}")
-                st.dataframe(
-                    disp[["value", "workloads", "Cost", "Min conf"]],
-                    hide_index=True, use_container_width=True,
-                    column_config={"value": f"{tag_key} =", "workloads": "Workloads"})
-
-            st.markdown("---")
-            st.info("📬 Queuing writes one row per workload (in the warehouse) with the "
-                    "AI's suggested value. The writer job applies the batch — dry-run by "
-                    "default — and every change is auditable & reversible.")
-            if st.button(f"🤖 Queue {n:,} AI-suggested tags", type="primary"):
-                batch_id = tagging._new_batch_id()
-                sql = queries.enqueue_from_suggestions_sql(
-                    batch_id, tagging._requested_by(), tag_key, min_conf, days, workspaces)
-                inserted = db.run_exec(sql)
-                # Some drivers don't report a rowcount for INSERT (run_exec → -1);
-                # fall back to the previewed count rather than show "-1 workloads".
-                shown = inserted if inserted is not None and inserted >= 0 else n
-                st.success(f"✅ Queued batch `{batch_id}` — {shown:,} workloads, "
-                           f"{fmt_money(cost)} attributable once applied.")
-                show_run_writer_next(batch_id)
-
-# ============================================================================= BATCHES
-elif view == VIEWS[4]:  # Batches & Rollback
-    st.subheader("Batches, status & rollback")
-    st.caption("Every queued change lives in the write queue. The **writer job** applies "
-               "batches (dry-run by default) and logs each change to the audit table, so a "
-               "whole batch can be rolled back exactly.")
-    st.info("**PENDING = queued, not yet applied.** The app only queues tag changes; "
-            "run the **tag-governance-writer** job to apply a batch (see the command "
-            "under any batch below). Statuses: PENDING → SUCCEEDED / FAILED / "
-            "UNSUPPORTED (policy-governed, e.g. serverless SQL & Apps) / SKIPPED_DRYRUN.")
-
-    try:
-        batches = db.run_query(queries.recent_batches())
-    except Exception as e:  # noqa: BLE001
-        batches = pd.DataFrame()
-        st.error(f"Couldn't read the queue table: {e}")
-
-    if batches.empty:
-        st.info("No batches yet. Queue some changes in **Tag & Verify** or **Bulk tag**.")
-    else:
-        disp = batches.copy()
-        disp["Batch"] = disp["batch_id"]
-        disp["Queued at"] = disp["enqueued_at"]
-        disp["By"] = disp["requested_by"]
-        disp["Workloads"] = disp["workloads"]
-        disp["Cost"] = disp["cost"].map(fmt_money)
-        disp["Pending"] = disp["pending"]
-        disp["Applied"] = disp["succeeded"]
-        disp["Failed"] = disp["failed"]
-        disp["Unsupported"] = disp["unsupported"]
-        disp["Dry-run"] = disp["dry_run"]
-        st.dataframe(
-            disp[["Batch", "Queued at", "By", "Workloads", "Cost", "Pending",
-                  "Applied", "Failed", "Unsupported", "Dry-run"]],
-            hide_index=True, use_container_width=True, height=240,
-        )
-
-        pick = st.selectbox("Inspect a batch", batches["batch_id"].tolist())
-        if pick:
-            colA, colB = st.columns(2)
-            with colA:
-                st.markdown("**Queue status**")
-                bs = db.run_query(queries.batch_status(pick))
-                st.dataframe(bs, hide_index=True, use_container_width=True)
-            with colB:
-                st.markdown("**Audit trail (old → new)**")
-                try:
-                    au = db.run_query(queries.audit_for_batch(pick))
-                    if au.empty:
-                        st.caption("No audit rows yet — writer hasn't run live on this batch.")
-                    else:
-                        st.dataframe(au, hide_index=True, use_container_width=True, height=240)
-                except Exception:
-                    st.caption("Audit table not readable.")
-
-            st.markdown("**Per-workload detail**")
-            rows = db.run_query(queries.batch_rows(pick))
-            if not rows.empty:
-                rd = rows.copy()
-                rd["Product"] = rd["product"].map(lambda p: PRODUCT_LABELS.get(p, p))
-                rd["Cost"] = rd["cost"].map(fmt_money)
-                st.dataframe(
-                    rd[["Product", "workload_name", "tag_key", "tag_value",
-                        "status", "last_error", "Cost"]],
-                    hide_index=True, use_container_width=True, height=300,
-                    column_config={"workload_name": "Workload", "tag_key": "Key",
-                                   "tag_value": "Value", "last_error": "Error"},
-                )
-
-        # How to run the writer / rollback — the app enqueues; a job applies.
-        st.markdown("---")
-        st.markdown("#### Apply or roll back")
-        st.markdown(
-            "The app **queues** changes; a Databricks **job** applies them so writes are "
-            "batched, rate-limited, resumable and auditable. Run from the CLI or the Jobs UI:"
-        )
-        st.code(
-            "# Apply a batch — dry-run first (writes nothing, logs intended old→new)\n"
-            "databricks bundle run tag-governance-writer -- \\\n"
-            "  --python-params dry_run=true batch_id=<BATCH_ID>\n\n"
-            "# Then apply for real (home workspace only in M1)\n"
-            "databricks bundle run tag-governance-writer -- \\\n"
-            "  --python-params dry_run=false batch_id=<BATCH_ID> workspace_id=<WS_ID>\n\n"
-            "# Roll a batch back — restore every tag to its pre-batch value\n"
-            "databricks bundle run tag-governance-rollback -- \\\n"
-            "  --python-params dry_run=false batch_id=<BATCH_ID>",
-            language="bash",
-        )
-
-# ============================================================================= ABOUT
-elif view == VIEWS[5]:  # How it works
-    st.markdown(
-        """
-### How this works
-
-1. **Scan** — reads `system.billing.usage` (last *N* days), joins current list prices,
-   and flags every workload **missing your chargeback keys**. Cost is computed from DBUs ×
-   current SKU rate.
-2. **Rank** — workloads are grouped by their resource id (`job_id`, `warehouse_id`,
-   `endpoint_id`, `dlt_pipeline_id`, …) and sorted by untagged cost, so you fix the
-   expensive gaps first.
-   - **Multi-workspace**: `system.billing.usage` is account-wide, so the app sees every
-     workspace with no extra login. Use the sidebar **Workspaces** filter to scope to one,
-     several, or all — and the *Untagged spend by workspace* view shows which workspaces
-     carry the most unattributable spend.
-3. **Suggest owner** — even with no tags, `identity_metadata` often tells us who owns/runs
-   the workload — a one-click starting point for the `team`/`owner` value.
-4. **Queue, don't mutate** — pick your own keys and values, **① Preview** the exact
-   per-resource API call, then **② Queue** it. The app *never* writes to a resource; it
-   records intent into a **write queue**. A separate **writer job** applies the queue
-   (dry-run by default), reading each resource's current tags and **merging** the new key
-   (never clobbering existing tags), cost-descending and per-workspace with rate-limit
-   backoff. Every change is logged to an **audit table** (old → new).
-5. **Verify & roll back** — the *Batches & Rollback* tab shows each batch's per-workload
-   status (Applied / Failed / Unsupported) and the audit trail. A whole batch can be rolled
-   back exactly, because every old→new value was recorded. Billing attribution follows on
-   future usage (~hours lag).
-
-**🤖 Advisory AI suggestion:** an `ai_query` pass annotates each workload with a *suggested*
-cost-center + confidence — a **hint** shown in the Scan table, targeting the workloads with
-no owner or a cryptic name that rules can't catch. It never writes or queues anything; a
-human still authors the rules.
-
-**Bulk tagging (for 1000s of workloads):** the *Bulk tag* tab lets you define a handful of
-**rules** — e.g. `owner equals data-eng@… → team=data-engineering`, or
-`name matches fraud-* → team=risk`. Rules are evaluated **in the warehouse**, and queuing is
-one `INSERT … SELECT` — so tens of thousands of workloads never round-trip through the app.
-The writer job then applies the batch and reports per-workload success/failure.
-
-**Why per-product matters:** Jobs, SQL warehouses, clusters, serving & (newer SDK)
-vector-search / Lakebase endpoints each have their own `custom_tags` API. Serverless
-products (serverless SQL, Apps) attribute cost via **budget/tag policies**, not free-form
-tags — the writer reports these as `UNSUPPORTED` with a reason rather than pretending.
-
-**Going forward:** pair this cleanup with **tag policies** so new workloads can't go
-untagged — the app clears the backlog, policy stops the bleeding.
-        """
-    )
+$("#days").onchange = loadOverview;
+$("#tagKey").onchange = loadOverview;
+loadOverview(); loadBatches();
+</script>
+</body></html>"""

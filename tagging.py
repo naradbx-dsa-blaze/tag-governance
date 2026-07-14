@@ -317,3 +317,56 @@ def approve(plan: TagPlan, workspace_id: str = "", is_serverless: bool = False,
                 "message": f"No tag-write path for product '{plan.product}' yet."}
     return enqueue_single(plan, workspace_id=workspace_id, is_serverless=is_serverless,
                           list_cost=list_cost)
+
+
+def enqueue_from_suggestions(batch_id: str, tag_key: str, min_confidence: float,
+                             days: int, workspaces=None,
+                             exclude_batch_id: str | None = None) -> int | None:
+    """Enqueue confident AI suggestions for `tag_key` into an EXISTING batch.
+
+    Reuses the caller's batch_id (so rules + AI land in one rollback-able unit).
+    Returns rows inserted (None if the driver reports no rowcount).
+    """
+    import db
+    import queries
+    sql = queries.enqueue_from_suggestions_sql(
+        batch_id=batch_id, requested_by=_requested_by(), tag_key=tag_key,
+        min_confidence=min_confidence, days=days, workspaces=workspaces,
+        exclude_batch_id=exclude_batch_id,
+    )
+    inserted = db.run_exec(sql)
+    return inserted if (inserted is not None and inserted >= 0) else None
+
+
+def auto_tag(tag_key: str, days: int, rules: list | None = None,
+             min_confidence: float = 0.8, workspaces=None) -> dict:
+    """The seamless one-shot: rules first, AI suggestions for the rest, ONE batch.
+
+    Everything enqueues under a single batch_id so it drains and rolls back as a
+    unit. Does NOT run the writer — the caller triggers the writer job (dry-run by
+    default) so the safety switch stays next to the code that mutates resources.
+    """
+    import db
+    import queries
+    batch_id = _new_batch_id()
+    rules = rules or []
+
+    rule_rows = 0
+    if rules:
+        rsql = queries.enqueue_bulk_sql(
+            batch_id=batch_id, requested_by=_requested_by(), days=days,
+            tag_keys=[tag_key], rules=rules, workspaces=workspaces,
+        )
+        if rsql is not None:
+            inserted = db.run_exec(rsql)
+            rule_rows = inserted if (inserted is not None and inserted >= 0) else 0
+
+    # AI fallback: only workloads a rule didn't already cover in this batch.
+    ai_rows = enqueue_from_suggestions(
+        batch_id=batch_id, tag_key=tag_key, min_confidence=min_confidence,
+        days=days, workspaces=workspaces, exclude_batch_id=batch_id,
+    ) or 0
+
+    return {"status": "ENQUEUED", "batch_id": batch_id,
+            "rule_rows": rule_rows, "ai_rows": ai_rows,
+            "total_rows": rule_rows + ai_rows}

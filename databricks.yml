@@ -167,7 +167,7 @@ resources:
         command:
           - sh
           - -c
-          - streamlit run app.py --server.port ${DATABRICKS_APP_PORT:-8000} --server.address 0.0.0.0
+          - uvicorn app:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}
         env:
           - name: DATABRICKS_WAREHOUSE_ID
             value_from: sql-warehouse
@@ -179,10 +179,6 @@ resources:
             value: ${var.audit_table}
           - name: TAG_GOVERNANCE_SUGGESTIONS_TABLE
             value: ${var.suggestions_table}
-          - name: STREAMLIT_SERVER_ENABLE_CORS
-            value: "false"
-          - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
-            value: "false"
 
 targets:
   dev:

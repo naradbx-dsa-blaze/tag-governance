@@ -1,19 +1,22 @@
 """Databricks SQL connectivity for the Tag Governance app.
 
-Uses a single cached connection (st.cache_resource) so Streamlit's per-interaction
-re-runs don't exhaust the connection pool with repeated OAuth handshakes.
+Framework-agnostic (no Streamlit). A single module-level connection is reused so
+we don't re-do the OAuth handshake on every request.
 
 Auth model:
   - On Databricks Apps, the service principal credentials are auto-injected and
     databricks.sdk.core.Config() picks them up; the warehouse id arrives via the
-    DATABRICKS_WAREHOUSE_ID env var (declared as a resource in app.yaml).
-  - Locally, Config() resolves the DATABRICKS_CONFIG_PROFILE / default profile.
+    DATABRICKS_WAREHOUSE_ID env var (declared as an app resource).
+  - Locally, Config() resolves DATABRICKS_CONFIG_PROFILE / the default profile.
 """
 from __future__ import annotations
 
 import os
-import pandas as pd
-import streamlit as st
+import threading
+from decimal import Decimal
+
+_conn = None
+_lock = threading.Lock()
 
 
 def _http_path() -> str:
@@ -21,49 +24,47 @@ def _http_path() -> str:
     if not wid:
         raise RuntimeError(
             "DATABRICKS_WAREHOUSE_ID is not set. Locally: export it before running; "
-            "on Databricks Apps: declare a sql-warehouse resource in app.yaml."
+            "on Databricks Apps: declare a sql-warehouse resource."
         )
     return f"/sql/1.0/warehouses/{wid}"
 
 
-@st.cache_resource(show_spinner=False)
 def get_connection():
-    from databricks import sql
-    from databricks.sdk.core import Config
+    """Lazily open one shared SQL connection (thread-safe)."""
+    global _conn
+    if _conn is not None:
+        return _conn
+    with _lock:
+        if _conn is None:
+            from databricks import sql
+            from databricks.sdk.core import Config
 
-    cfg = Config()
-    return sql.connect(
-        server_hostname=cfg.host,
-        http_path=_http_path(),
-        credentials_provider=lambda: cfg.authenticate,
-    )
+            cfg = Config()
+            _conn = sql.connect(
+                server_hostname=cfg.host,
+                http_path=_http_path(),
+                credentials_provider=lambda: cfg.authenticate,
+            )
+    return _conn
 
 
-@st.cache_data(ttl=300, show_spinner="Scanning workloads…")
-def run_query(sql_text: str) -> pd.DataFrame:
-    """Run a read query and return a DataFrame. Cached for 5 min per distinct SQL."""
+def _coerce(v):
+    """Decimals -> float so JSON serialization is clean; leave everything else."""
+    return float(v) if isinstance(v, Decimal) else v
+
+
+def run_query(sql_text: str) -> list[dict]:
+    """Run a read query and return a list of dict rows (JSON-friendly)."""
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute(sql_text)
         cols = [c[0] for c in cur.description]
         rows = cur.fetchall()
-    df = pd.DataFrame(rows, columns=cols)
-    # Warehouse returns DECIMAL for cost/pct columns; Streamlit charts can't infer
-    # a vega type from Python Decimal. Coerce decimals to float so charts/metrics
-    # render cleanly without UserWarnings.
-    from decimal import Decimal
-    for c in df.columns:
-        if len(df) and isinstance(df[c].iloc[0], Decimal):
-            df[c] = df[c].astype(float)
-    return df
+    return [{c: _coerce(v) for c, v in zip(cols, r)} for r in rows]
 
 
 def run_exec(sql_text: str) -> int:
-    """Run a write statement (INSERT/DELETE/MERGE). NOT cached — it mutates.
-
-    Returns the affected row count when the driver reports one, else -1. Unlike
-    run_query it never touches cur.description/fetchall, which are absent for DML.
-    """
+    """Run a write statement (INSERT/DELETE/MERGE). Returns affected rows or -1."""
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute(sql_text)

@@ -618,14 +618,28 @@ LIMIT {limit}
 
 
 def enqueue_from_suggestions_sql(batch_id, requested_by, tag_key, min_confidence,
-                                 days, workspaces=None):
+                                 days, workspaces=None, exclude_batch_id=None):
     """INSERT one queue row per confident suggestion — tag_value = the AI's pick.
 
     This is the agent-driven bulk path: no per-workload typing. Evaluated entirely
     in the warehouse, so 1000s of workloads enqueue in one statement. The CTE must
     follow INSERT INTO (INSERT INTO t WITH cte AS (...) SELECT ...).
+
+    exclude_batch_id: if given, workloads already queued for `tag_key` in that
+    batch are skipped — this is how the "rules first, AI for the rest" auto-tag
+    flow avoids double-tagging a workload a rule already covered.
     """
     cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
+    exclude = ""
+    if exclude_batch_id:
+        exclude = f"""
+  AND NOT EXISTS (
+    SELECT 1 FROM {QUEUE_TABLE} q
+    WHERE q.batch_id = {_sql_str(exclude_batch_id)}
+      AND q.tag_key = {_sql_str(tag_key)}
+      AND q.workload_id = cand.workload_id
+      AND q.product = cand.product
+  )"""
     return f"""
 INSERT INTO {QUEUE_TABLE}
   (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
@@ -642,4 +656,5 @@ SELECT
   'PENDING'                 AS status,
   0                         AS attempts
 FROM cand
+WHERE 1=1{exclude}
 """
