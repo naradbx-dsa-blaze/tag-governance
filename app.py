@@ -309,13 +309,15 @@ INDEX_HTML = """<!doctype html>
         <div class="toggle"><input type="checkbox" id="rulesUseAi">
           <label for="rulesUseAi" style="margin:0">Also use AI for workloads no rule matched (off = pure rules)</label></div>
         <div class="row" style="margin-top:6px">
-          <button class="ghost" onclick="doRulePreview()">Preview impact</button>
+          <button onclick="doRulePreview()">1️⃣ Show the workloads this will tag</button>
         </div>
+        <p class="note">You must review the exact workloads before you can apply — a rule
+           can lump unrelated workloads under one team.</p>
         <div id="rulePreviewBox"></div>
         <div id="rulesApplyRow" style="display:none">
           <div class="toggle"><input type="checkbox" id="rulesDryRun">
             <label for="rulesDryRun" style="margin:0">Dry run only (preview, writes nothing)</label></div>
-          <button onclick="doRulesApply()">Apply tags via rules</button>
+          <button onclick="doRulesApply()">2️⃣ Apply tags to the workloads above</button>
         </div>
       </div>
 
@@ -451,17 +453,24 @@ function addRule(){
   // (owner emails, product names, …) so you pick from actual data instead of
   // typing a raw email. Changing the field refetches the list.
   tr.innerHTML =
-    `<td><select class=rf onchange="fillFieldValues(${id}, this.value)">`+
+    `<td><select class=rf onchange="fillFieldValues(${id}, this.value); rulesDirty()">`+
     `<option>owner</option><option>name</option><option>product</option>`+
     `<option>workspace</option></select></td>`+
-    `<td><select class=ro><option>contains</option><option>equals</option>`+
+    `<td><select class=ro onchange="rulesDirty()"><option>contains</option><option>equals</option>`+
     `<option>matches</option></select></td>`+
-    `<td><input class=rv list="dl-${id}" placeholder="pick or type…">`+
+    `<td><input class=rv list="dl-${id}" placeholder="pick or type…" oninput="rulesDirty()">`+
     `<datalist id="dl-${id}"></datalist></td>`+
-    `<td><input class=rt placeholder="tag value e.g. data-eng"></td>`+
-    `<td><button class=ghost style="margin:0;padding:4px 9px" onclick="this.closest('tr').remove()">✕</button></td>`;
+    `<td><input class=rt placeholder="tag value e.g. data-eng" oninput="rulesDirty()"></td>`+
+    `<td><button class=ghost style="margin:0;padding:4px 9px" onclick="this.closest('tr').remove(); rulesDirty()">✕</button></td>`;
   tb.appendChild(tr);
   fillFieldValues(id, "owner");   // preload owner values
+  rulesDirty();
+}
+// Any rule edit invalidates a prior preview — hide Apply until re-previewed, so
+// you can never apply a rule set you haven't just seen the workloads for.
+function rulesDirty(){
+  const ar = $("#rulesApplyRow"); if(ar) ar.style.display = "none";
+  const pb = $("#rulePreviewBox"); if(pb) pb.innerHTML = "";
 }
 async function fillFieldValues(id, field){
   const dl = document.getElementById("dl-"+id); if(!dl) return;
