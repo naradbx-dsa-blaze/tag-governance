@@ -502,8 +502,14 @@ def freshness():
 # never round-trips through the browser.
 
 def _sql_str(v):
-    """Quote-escape a python string for inline SQL."""
-    return "'" + str(v).replace("'", "''") + "'"
+    """Quote-escape a python string as a SQL literal. Doubles single quotes AND
+    escapes backslashes — Databricks/Spark honors C-style backslash escapes in
+    string literals, so a lone trailing backslash could otherwise escape the
+    closing quote. Also strips NUL/newlines. Belt-and-suspenders with the API-side
+    charset validation in app._validate_tag."""
+    s = str(v).replace("\\", "\\\\").replace("'", "''")
+    s = s.replace("\x00", "").replace("\n", " ").replace("\r", " ")
+    return "'" + s + "'"
 
 
 def enqueue_bulk_sql(batch_id, requested_by, days, tag_keys, rules, workspaces=None):

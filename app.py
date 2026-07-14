@@ -35,6 +35,25 @@ def _deny(reason: str) -> JSONResponse:
     return JSONResponse({"error": reason, "denied": True}, status_code=403)
 
 
+# Defense-in-depth: validate tag keys/values at the API boundary BEFORE they ever
+# reach a SQL builder. Databricks custom tags allow letters, digits, spaces, and
+# + - = . _ : / @, max 255 chars (UC/compute tag rules). Anything else is rejected
+# up front — belt-and-suspenders alongside _sql_str quote-escaping.
+import re as _re
+_TAG_RE = _re.compile(r"^[A-Za-z0-9 +\-=._:/@]{1,255}$")
+
+
+class BadInput(Exception):
+    pass
+
+
+def _validate_tag(key: str, value: str):
+    if not key or not _TAG_RE.match(key):
+        raise BadInput(f"Invalid tag key {key!r}: allowed chars A-Z a-z 0-9 space +-=._:/@, max 255.")
+    if value is None or not _TAG_RE.match(value):
+        raise BadInput(f"Invalid tag value {value!r}: allowed chars A-Z a-z 0-9 space +-=._:/@, max 255.")
+
+
 def _gate_live_write(request: Request, dry_run: bool):
     """Return a 403 JSONResponse if this LIVE write isn't authorized, else None.
     Also stamps the requester email so batches record WHO acted. Dry-runs are
@@ -109,6 +128,10 @@ def auto_tag(body: AutoTagBody, request: Request):
     if denied:
         return denied
     try:
+        # Validate the key + every rule's tag values before they reach SQL.
+        for r in (body.rules or []):
+            for k, v in (r.get("tags") or {}).items():
+                _validate_tag(k, v)
         result = tagging.auto_tag(
             tag_key=body.tag_key, days=body.days, rules=body.rules,
             min_confidence=body.min_confidence, use_ai=body.use_ai,
@@ -119,6 +142,8 @@ def auto_tag(body: AutoTagBody, request: Request):
             return {**result, "run": None, "message": f"Nothing matched — {hint}."}
         run = jobs.run_writer(result["batch_id"], dry_run=body.dry_run)
         return {**result, "run": run}
+    except BadInput as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -159,12 +184,16 @@ def tag_selected(body: TagSelectedBody, request: Request):
     if denied:
         return denied
     try:
+        for w in (body.workloads or []):
+            _validate_tag(body.tag_key, (w or {}).get("tag_value"))
         result = tagging.tag_selected(body.tag_key, body.workloads)
         if result.get("status") != "ENQUEUED" or result.get("total_rows", 0) == 0:
             return {**result, "run": None,
                     "message": result.get("message", "No workloads selected.")}
         run = jobs.run_writer(result["batch_id"], dry_run=body.dry_run)
         return {**result, "run": run}
+    except BadInput as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -188,6 +217,7 @@ def manual_tag(body: ManualTagBody, request: Request):
     if denied:
         return denied
     try:
+        _validate_tag(body.tag_key, body.tag_value)
         plan = tagging.plan_for(
             product=body.product, workload_id=body.workload_id,
             workload_name=body.workload_name, tags={body.tag_key: body.tag_value},
@@ -200,6 +230,8 @@ def manual_tag(body: ManualTagBody, request: Request):
             return res
         run = jobs.run_writer(res["batch_id"], dry_run=body.dry_run)
         return {**res, "run": run}
+    except BadInput as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
