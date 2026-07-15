@@ -29,6 +29,10 @@ const money = (v: unknown) => {
 const num = (v: unknown) => Number(v ?? 0);
 type Row = Record<string, unknown>;
 
+// After an apply, jump to the batches list so the user sees the progress bar fill.
+const scrollToBatches = () =>
+  setTimeout(() => document.getElementById("batches-section")?.scrollIntoView({ behavior: "smooth" }), 300);
+
 // ---------- top controls ----------
 function useControls() {
   const [tagKey, setTagKey] = useState("cost_center");
@@ -212,6 +216,7 @@ function AiMode({ tagKey, days, onResult }: ModeProps) {
     onResult(d.run
       ? { kind: "info", html: `Batch <b>${d.batch_id}</b> — ${d.total_rows} queued, writer ${dry ? "dry-run" : "LIVE"}: <a class="underline" href="${(d.run as Row).url}" target="_blank">view run →</a>` }
       : { kind: "warn", html: d.message ?? "Nothing to do" });
+    if (d.run) scrollToBatches();
   };
 
   return (
@@ -306,6 +311,7 @@ function RulesMode({ tagKey, days, onResult }: ModeProps) {
     onResult(d.run
       ? { kind: "info", html: `Batch <b>${d.batch_id}</b> — ${d.total_rows} queued, ${dry ? "dry-run" : "LIVE"}: <a class="underline" href="${(d.run as Row).url}" target="_blank">view run →</a>` }
       : { kind: "warn", html: d.message ?? "Nothing matched" });
+    if (d.run) scrollToBatches();
   };
 
   return (
@@ -389,6 +395,7 @@ function ManualMode({ tagKey, onResult }: ModeProps) {
     onResult(d.run
       ? { kind: "info", html: `Batch <b>${d.batch_id}</b> queued, ${dry ? "dry-run" : "LIVE"}: <a class="underline" href="${(d.run as Row).url}" target="_blank">view run →</a>` }
       : { kind: "warn", html: d.message ?? d.status ?? "Failed" });
+    if (d.run) scrollToBatches();
   };
   return (
     <div className="space-y-3">
@@ -445,21 +452,30 @@ function NotTaggable({ tagKey, days }: { tagKey: string; days: number }) {
 
 // ---------- Batches + live progress + rollback ----------
 function Batches() {
-  const { data, refetch } = useBatches({ params: { limit: 15 }, query: { refetchInterval: 4000 } });
+  // Poll fast (2s) while any job is in flight so tagging fills / rollback drains live.
+  const { data, refetch } = useBatches({ params: { limit: 15 }, query: { refetchInterval: 2000 } });
   const rollback = useRollback();
   const [links, setLinks] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<Record<string, string>>({}); // batch_id -> status text
   const batches = (data?.data.batches ?? []) as Row[];
 
   const doRollback = async (id: string) => {
-    if (!confirm(`Roll back batch ${id} for REAL? Removes the tags it applied and makes those workloads re-taggable. The bar drains toward 0%.`)) return;
-    const res = await rollback.mutateAsync({ batch_id: id, dry_run: false });
-    const url = (res.data.run as Row | undefined)?.url;
-    if (url) setLinks((l) => ({ ...l, [id]: String(url) }));
+    if (!confirm(`Roll back batch ${id} for REAL?\n\nRemoves the tags it applied (restoring prior values) and makes those workloads re-taggable. The bar drains toward 0%.`)) return;
+    setBusy((b) => ({ ...b, [id]: "starting rollback…" }));
+    try {
+      const res = await rollback.mutateAsync({ batch_id: id, dry_run: false });
+      const url = (res.data.run as Row | undefined)?.url;
+      if (url) setLinks((l) => ({ ...l, [id]: String(url) }));
+      setBusy((b) => ({ ...b, [id]: "rolling back…" }));
+    } catch (e) {
+      setBusy((b) => ({ ...b, [id]: "rollback failed — check permissions" }));
+      return;
+    }
     refetch();
   };
 
   return (
-    <section>
+    <section id="batches-section">
       <h2 className="mb-3 text-xs font-bold uppercase tracking-wider text-muted-foreground">Batches &amp; rollback</h2>
       <Card className="p-0">
         <Table>
@@ -469,9 +485,14 @@ function Batches() {
           </TableRow></TableHeader>
           <TableBody>
             {batches.map((b) => {
+              const id = String(b.batch_id);
               const total = num(b.rows);
               const tagged = num(b.succeeded);
               const pct = total ? Math.round((100 * tagged) / total) : 0;
+              // Clear the transient "rolling back…" note once the batch has drained.
+              if (busy[id] && tagged === 0 && num(b.rolled_back) > 0) {
+                queueMicrotask(() => setBusy((x) => { const n = { ...x }; delete n[id]; return n; }));
+              }
               const parts: string[] = [];
               if (tagged) parts.push(`${tagged} tagged`);
               if (num(b.rolled_back)) parts.push(`${num(b.rolled_back)} rolled back`);
@@ -480,20 +501,23 @@ function Batches() {
               if (num(b.pending)) parts.push(`${num(b.pending)} not run yet`);
               if (num(b.running)) parts.push(`${num(b.running)} running…`);
               return (
-                <TableRow key={String(b.batch_id)}>
-                  <TableCell><Badge variant="secondary">{String(b.batch_id)}</Badge></TableCell>
+                <TableRow key={id}>
+                  <TableCell><Badge variant="secondary">{id}</Badge></TableCell>
                   <TableCell className="text-right tabular-nums">{money(b.cost)}</TableCell>
                   <TableCell>
                     <Progress value={pct} className="h-1.5" />
-                    <span className="text-xs text-muted-foreground">{tagged}/{total} tagged · {pct}%</span>
+                    <span className="text-xs text-muted-foreground">
+                      {tagged}/{total} tagged · {pct}%{busy[id] ? ` · ${busy[id]}` : ""}
+                    </span>
                   </TableCell>
                   <TableCell className="text-sm">{parts.join(" · ") || "—"}</TableCell>
                   <TableCell className="whitespace-nowrap">
                     {tagged > 0 && (
-                      <Button variant="secondary" size="sm" onClick={() => doRollback(String(b.batch_id))}>Rollback</Button>
+                      <Button variant="secondary" size="sm" disabled={!!busy[id]}
+                        onClick={() => doRollback(id)}>Rollback</Button>
                     )}
-                    {links[String(b.batch_id)] && (
-                      <a className="ml-2 text-xs underline" href={links[String(b.batch_id)]} target="_blank" rel="noreferrer">view run →</a>
+                    {links[id] && (
+                      <a className="ml-2 text-xs underline" href={links[id]} target="_blank" rel="noreferrer">view run →</a>
                     )}
                   </TableCell>
                 </TableRow>
