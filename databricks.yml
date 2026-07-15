@@ -9,14 +9,169 @@ artifacts:
   default:
     build: apx build
 
+# Same vars as the original bundle — customer overrides these per target.
+variables:
+  warehouse_id:
+    default: 148ccb90800933a1
+  summary_table:
+    default: main.tag_governance.workload_daily
+  queue_table:
+    default: main.tag_governance.write_queue
+  audit_table:
+    default: main.tag_governance.audit
+  suggestions_table:
+    default: main.tag_governance.suggestions
+  annotate_model:
+    default: databricks-meta-llama-3-3-70b-instruct
+  account_sp_scope:
+    default: ""
+  admin_group:
+    default: "OPEN"
+
 resources:
   apps:
     tag-governance-app:
       name: "tag-governance"
-      description: "tag-governance created with apx"
+      description: "Chargeback tagging for Databricks (AppKit/apx rebuild)"
       source_code_path: ./.build
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+      config:
+        env:
+          - name: DATABRICKS_WAREHOUSE_ID
+            value_from: sql-warehouse
+          - name: TAG_GOVERNANCE_SUMMARY_TABLE
+            value: ${var.summary_table}
+          - name: TAG_GOVERNANCE_QUEUE_TABLE
+            value: ${var.queue_table}
+          - name: TAG_GOVERNANCE_AUDIT_TABLE
+            value: ${var.audit_table}
+          - name: TAG_GOVERNANCE_SUGGESTIONS_TABLE
+            value: ${var.suggestions_table}
+          - name: TAG_GOVERNANCE_ADMIN_GROUP
+            value: ${var.admin_group}
+
+  jobs:
+    tag-governance-refresh:
+      name: tag-governance-refresh
+      description: "Daily rebuild of the pre-aggregated untagged-workload summary table"
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: "America/New_York"
+      parameters:
+        - name: summary_table
+          default: ${var.summary_table}
+      tasks:
+        - task_key: materialize
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./materialize.sql
+            parameters:
+              summary_table: ${var.summary_table}
+
+    tag-governance-annotate:
+      name: tag-governance-annotate
+      description: "Weekly rebuild of advisory ai_query cost-center suggestions"
+      schedule:
+        quartz_cron_expression: "0 13 7 ? * MON"
+        timezone_id: "America/New_York"
+      tasks:
+        - task_key: annotate
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./annotate.sql
+            parameters:
+              summary_table: ${var.summary_table}
+              suggestions_table: ${var.suggestions_table}
+              annotate_model: ${var.annotate_model}
+
+    tag-governance-writer:
+      name: tag-governance-writer
+      description: "Drain the write queue and apply tags (dry-run by default), cost-descending with audit"
+      parameters:
+        - name: queue_table
+          default: ${var.queue_table}
+        - name: audit_table
+          default: ${var.audit_table}
+        - name: dry_run
+          default: "true"
+        - name: workspace_id
+          default: ""
+        - name: batch_id
+          default: ""
+        - name: max_workers
+          default: "4"
+        - name: account_sp_scope
+          default: ${var.account_sp_scope}
+        - name: smoke_test
+          default: "false"
+      tasks:
+        - task_key: drain_queue
+          spark_python_task:
+            python_file: ./src/tag_governance/backend/writer_job.py
+            parameters:
+              - queue_table={{job.parameters.queue_table}}
+              - audit_table={{job.parameters.audit_table}}
+              - dry_run={{job.parameters.dry_run}}
+              - workspace_id={{job.parameters.workspace_id}}
+              - batch_id={{job.parameters.batch_id}}
+              - smoke_test={{job.parameters.smoke_test}}
+              - max_workers={{job.parameters.max_workers}}
+              - account_sp_scope={{job.parameters.account_sp_scope}}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+      permissions:
+        - level: CAN_MANAGE_RUN
+          service_principal_name: ${resources.apps.tag-governance-app.service_principal_client_id}
+
+    tag-governance-rollback:
+      name: tag-governance-rollback
+      description: "Undo a batch by replaying the audit log in reverse"
+      parameters:
+        - name: audit_table
+          default: ${var.audit_table}
+        - name: queue_table
+          default: ${var.queue_table}
+        - name: batch_id
+          default: ""
+        - name: dry_run
+          default: "true"
+        - name: max_workers
+          default: "4"
+        - name: account_sp_scope
+          default: ${var.account_sp_scope}
+      tasks:
+        - task_key: rollback_batch
+          spark_python_task:
+            python_file: ./src/tag_governance/backend/rollback_job.py
+            parameters:
+              - audit_table={{job.parameters.audit_table}}
+              - queue_table={{job.parameters.queue_table}}
+              - batch_id={{job.parameters.batch_id}}
+              - dry_run={{job.parameters.dry_run}}
+              - max_workers={{job.parameters.max_workers}}
+              - account_sp_scope={{job.parameters.account_sp_scope}}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+      permissions:
+        - level: CAN_MANAGE_RUN
+          service_principal_name: ${resources.apps.tag-governance-app.service_principal_client_id}
 
 targets:
   dev:
     mode: development
     default: true
+    workspace:
+      host: https://adb-984752964297111.11.azuredatabricks.net
+      profile: fe-east
