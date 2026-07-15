@@ -1,0 +1,507 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useState } from "react";
+import {
+  useOverview, useAiPreview, useBatches, useNotTaggable,
+  useRulePreview, useTagSelected, useManualTag, useRollback,
+  fieldValues,
+} from "@/lib/api";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+} from "@/components/ui/table";
+import { ModeToggle } from "@/components/apx/mode-toggle";
+
+export const Route = createFileRoute("/")({ component: () => <App /> });
+
+// ---------- helpers ----------
+const money = (v: unknown) => {
+  const n = Number(v);
+  if (!isFinite(n)) return "—";
+  if (Math.abs(n) >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (Math.abs(n) >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
+  return `$${Math.round(n).toLocaleString()}`;
+};
+const num = (v: unknown) => Number(v ?? 0);
+type Row = Record<string, unknown>;
+
+// ---------- top controls ----------
+function useControls() {
+  const [tagKey, setTagKey] = useState("cost_center");
+  const [days, setDays] = useState(30);
+  return { tagKey, setTagKey, days, setDays };
+}
+
+function App() {
+  const c = useControls();
+  const [mode, setMode] = useState<"ai" | "rules" | "manual">("ai");
+  const [banner, setBanner] = useState<{ kind: "info" | "warn"; html: string } | null>(null);
+
+  return (
+    <div className="min-h-screen bg-background text-foreground">
+      <header className="flex items-center gap-3 border-b px-8 py-4">
+        <span className="text-2xl">🏷️</span>
+        <div className="flex-1">
+          <h1 className="text-xl font-bold tracking-tight">Tag Governance</h1>
+          <p className="text-sm text-muted-foreground">
+            Find untagged spend · attribute it to teams · tag safely &amp; reversibly
+          </p>
+        </div>
+        <ModeToggle />
+      </header>
+
+      <main className="mx-auto max-w-6xl space-y-8 px-8 py-8">
+        {/* controls */}
+        <div className="flex flex-wrap items-end gap-6">
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-muted-foreground">Tag key</label>
+            <Input value={c.tagKey} onChange={(e) => c.setTagKey(e.target.value)} className="w-56" />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-muted-foreground">Lookback (days)</label>
+            <select
+              value={c.days}
+              onChange={(e) => c.setDays(Number(e.target.value))}
+              className="h-9 rounded-md border bg-background px-3 text-sm"
+            >
+              {[7, 14, 30, 60, 90].map((d) => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <Overview tagKey={c.tagKey} days={c.days} />
+
+        <section>
+          <h2 className="mb-3 text-xs font-bold uppercase tracking-wider text-muted-foreground">
+            Tag workloads
+          </h2>
+          <Card className="p-6">
+            <div className="mb-4 flex gap-2">
+              {(["ai", "rules", "manual"] as const).map((m) => (
+                <Button key={m} variant={mode === m ? "default" : "secondary"}
+                  size="sm" onClick={() => { setMode(m); setBanner(null); }}>
+                  {m === "ai" ? "🤖 AI suggestions" : m === "rules" ? "📋 Rules (no AI)" : "✏️ Manual"}
+                </Button>
+              ))}
+            </div>
+            {mode === "ai" && <AiMode {...c} onResult={setBanner} />}
+            {mode === "rules" && <RulesMode {...c} onResult={setBanner} />}
+            {mode === "manual" && <ManualMode {...c} onResult={setBanner} />}
+            {banner && (
+              <div className={`mt-4 rounded-lg border p-3 text-sm ${
+                banner.kind === "warn"
+                  ? "border-amber-500/40 bg-amber-500/10"
+                  : "border-sky-500/40 bg-sky-500/10"}`}
+                dangerouslySetInnerHTML={{ __html: banner.html }} />
+            )}
+          </Card>
+        </section>
+
+        <NotTaggable tagKey={c.tagKey} days={c.days} />
+        <Batches />
+      </main>
+    </div>
+  );
+}
+
+// ---------- Overview KPIs + progress ----------
+function Overview({ tagKey, days }: { tagKey: string; days: number }) {
+  const { data, isLoading } = useOverview({ params: { tag_key: tagKey, days } });
+  const k = (data?.data.kpi ?? {}) as Row;
+  const products = (data?.data.products ?? []) as Row[];
+  const tagged = num(k.tagged_live_cost);
+  const untagged = num(k.untagged_cost);
+  const pct = tagged + untagged > 0 ? (100 * tagged) / (tagged + untagged) : 0;
+
+  const tiles = [
+    { label: "Untagged spend", val: money(k.untagged_cost), accent: "bg-red-500" },
+    { label: "% untagged", val: `${k.pct_untagged ?? "—"}%`, accent: "bg-amber-500" },
+    { label: "Untagged workloads", val: num(k.untagged_workloads).toLocaleString(), accent: "bg-sky-500" },
+    { label: "Tagged so far (live)", val: money(k.tagged_live_cost), accent: "bg-emerald-500" },
+  ];
+
+  return (
+    <section>
+      <h2 className="mb-3 text-xs font-bold uppercase tracking-wider text-muted-foreground">
+        Untagged spend
+      </h2>
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+        {tiles.map((t) => (
+          <Card key={t.label} className="relative overflow-hidden p-5">
+            <div className={`absolute left-0 top-0 h-full w-1 ${t.accent}`} />
+            <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t.label}</div>
+            <div className="mt-1 text-3xl font-extrabold tabular-nums">{isLoading ? "…" : t.val}</div>
+          </Card>
+        ))}
+      </div>
+      <div className="mt-4">
+        <Progress value={pct} className="h-2" />
+        <p className="mt-1.5 text-sm text-muted-foreground">
+          {num(k.tagged_live_workloads) > 0
+            ? <><b>{money(tagged)}</b> attributed across <b>{num(k.tagged_live_workloads).toLocaleString()}</b> workloads this session — updates live as you tag.</>
+            : "No workloads tagged yet this session. Tag some below and watch this move."}
+        </p>
+      </div>
+      {products.length > 0 && (
+        <Card className="mt-4 p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Product</TableHead>
+                <TableHead className="text-right">Untagged</TableHead>
+                <TableHead className="text-right">Total</TableHead>
+                <TableHead className="text-right">% untagged</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {products.map((p, i) => (
+                <TableRow key={i}>
+                  <TableCell>{String(p.product)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{money(p.untagged_cost)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{money(p.total_cost)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{String(p.pct_untagged)}%</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
+    </section>
+  );
+}
+
+type ModeProps = {
+  tagKey: string; days: number;
+  onResult: (b: { kind: "info" | "warn"; html: string } | null) => void;
+};
+
+// ---------- AI mode (editable values) ----------
+function AiMode({ tagKey, days, onResult }: ModeProps) {
+  const [conf, setConf] = useState(0.8);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [vals, setVals] = useState<Record<number, string>>({});
+  const [dry, setDry] = useState(false);
+  const preview = useAiPreview({ params: { tag_key: tagKey, days, min_confidence: conf }, query: { enabled: false } });
+  const apply = useTagSelected();
+
+  const doPreview = async () => {
+    const r = await preview.refetch();
+    const wl = (r.data?.data.workloads ?? []) as Row[];
+    setRows(wl);
+    setVals(Object.fromEntries(wl.map((w, i) => [i, String(w.new_tag_value ?? "")])));
+    const imp = (r.data?.data.impact ?? {}) as Row;
+    onResult(wl.length === 0
+      ? { kind: "warn", html: "No taggable workloads have a confident suggestion at this cutoff." }
+      : { kind: "info", html: `<b>${num(imp.workloads).toLocaleString()}</b> workloads (${money(imp.cost)}) — edit any AI value, then apply.` });
+  };
+
+  const doApply = async () => {
+    const workloads = rows.map((w, i) => ({
+      workload_id: w.workload_id, product: w.product, workspace_id: w.workspace_id,
+      workload_name: w.workload_name, is_serverless: w.is_serverless,
+      tag_value: (vals[i] ?? "").trim(), cost: w.cost,
+    })).filter((w) => w.tag_value);
+    if (!workloads.length) return onResult({ kind: "warn", html: "No values to apply." });
+    if (!dry && !confirm(`Apply tags for REAL to ${workloads.length} workload(s)?`)) return;
+    const res = await apply.mutateAsync({ tag_key: tagKey, workloads, dry_run: dry });
+    const d = res.data;
+    onResult(d.run
+      ? { kind: "info", html: `Batch <b>${d.batch_id}</b> — ${d.total_rows} queued, writer ${dry ? "dry-run" : "LIVE"}: <a class="underline" href="${(d.run as Row).url}" target="_blank">view run →</a>` }
+      : { kind: "warn", html: d.message ?? "Nothing to do" });
+  };
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground">
+        The AI suggests a value per untagged workload above the cutoff. <b>Edit any</b> before applying.
+      </p>
+      <div className="flex items-end gap-4">
+        <div>
+          <label className="mb-1 block text-xs font-semibold text-muted-foreground">Confidence cutoff</label>
+          <select value={conf} onChange={(e) => setConf(Number(e.target.value))}
+            className="h-9 rounded-md border bg-background px-3 text-sm">
+            {[0.6, 0.7, 0.8, 0.9].map((v) => <option key={v} value={v}>{v}</option>)}
+          </select>
+        </div>
+        <Button variant="secondary" onClick={doPreview} disabled={preview.isFetching}>
+          1️⃣ Preview which workloads
+        </Button>
+      </div>
+      {rows.length > 0 && (
+        <>
+          <div className="max-h-80 overflow-auto rounded-md border">
+            <Table>
+              <TableHeader><TableRow>
+                <TableHead>Workload</TableHead><TableHead>Product</TableHead>
+                <TableHead className="text-right">Cost</TableHead>
+                <TableHead>Set value (editable)</TableHead><TableHead className="text-right">Conf</TableHead>
+              </TableRow></TableHeader>
+              <TableBody>
+                {rows.map((w, i) => (
+                  <TableRow key={i}>
+                    <TableCell className="max-w-52 truncate">{String(w.workload_name ?? w.workload_id)}</TableCell>
+                    <TableCell>{String(w.product)}</TableCell>
+                    <TableCell className="text-right tabular-nums">{money(w.cost)}</TableCell>
+                    <TableCell>
+                      <Input value={vals[i] ?? ""} onChange={(e) => setVals({ ...vals, [i]: e.target.value })}
+                        className="h-8 w-40" />
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{String(w.confidence)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={dry} onCheckedChange={(v) => setDry(!!v)} /> Dry run only (writes nothing)
+          </label>
+          <Button onClick={doApply} disabled={apply.isPending}>2️⃣ Apply to these workloads</Button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- Rules mode ----------
+type Rule = { field: string; op: string; value: string; tagVal: string };
+function RulesMode({ tagKey, days, onResult }: ModeProps) {
+  const [rules, setRules] = useState<Rule[]>([{ field: "owner", op: "contains", value: "", tagVal: "" }]);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [vals, setVals] = useState<Record<number, string>>({});
+  const [checked, setChecked] = useState<Record<number, boolean>>({});
+  const [dry, setDry] = useState(false);
+  const [ownerOpts, setOwnerOpts] = useState<string[]>([]);
+  const preview = useRulePreview();
+  const apply = useTagSelected();
+
+  const apiRules = () => rules.filter((r) => r.value && r.tagVal)
+    .map((r) => ({ field: r.field, op: r.op, value: r.value, tags: { [tagKey]: r.tagVal } }));
+
+  const doPreview = async () => {
+    const rs = apiRules();
+    if (!rs.length) return onResult({ kind: "warn", html: "Add at least one complete rule." });
+    const res = await preview.mutateAsync({ tag_key: tagKey, days, rules: rs });
+    const wl = (res.data.workloads ?? []) as Row[];
+    setRows(wl);
+    setVals(Object.fromEntries(wl.map((w, i) => [i, String(w.new_tag_value ?? "")])));
+    setChecked(Object.fromEntries(wl.map((_, i) => [i, true])));
+    const imp = (res.data.impact ?? {}) as Row;
+    onResult({ kind: "info", html: `Matches <b>${num(imp.matched_count).toLocaleString()}</b> of ${num(imp.total_untagged).toLocaleString()} untagged (${money(imp.matched_cost)}). Uncheck any that don't belong; edit values.` });
+  };
+
+  const doApply = async () => {
+    const workloads = rows.map((w, i) => ({
+      workload_id: w.workload_id, product: w.product, workspace_id: w.workspace_id,
+      workload_name: w.workload_name, is_serverless: w.is_serverless,
+      tag_value: (vals[i] ?? "").trim(), cost: w.cost,
+    })).filter((_, i) => checked[i]).filter((w) => w.tag_value);
+    if (!workloads.length) return onResult({ kind: "warn", html: "No workloads checked." });
+    if (!dry && !confirm(`Apply tags for REAL to ${workloads.length} workload(s)?`)) return;
+    const res = await apply.mutateAsync({ tag_key: tagKey, workloads, dry_run: dry });
+    const d = res.data;
+    onResult(d.run
+      ? { kind: "info", html: `Batch <b>${d.batch_id}</b> — ${d.total_rows} queued, ${dry ? "dry-run" : "LIVE"}: <a class="underline" href="${(d.run as Row).url}" target="_blank">view run →</a>` }
+      : { kind: "warn", html: d.message ?? "Nothing matched" });
+  };
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground">Deterministic rules — no AI. Build rules, preview the exact workloads, apply only what you keep.</p>
+      {rules.map((r, i) => (
+        <div key={i} className="flex flex-wrap items-center gap-2">
+          <select value={r.field} className="h-9 rounded-md border bg-background px-2 text-sm"
+            onChange={async (e) => {
+              const nr = [...rules]; nr[i].field = e.target.value; setRules(nr);
+              const v = await fieldValues({ field: e.target.value, days });
+              setOwnerOpts((v.data.values as Row[]).map((x) => String(x.value)));
+            }}>
+            {["owner", "name", "product", "workspace"].map((f) => <option key={f}>{f}</option>)}
+          </select>
+          <select value={r.op} className="h-9 rounded-md border bg-background px-2 text-sm"
+            onChange={(e) => { const nr = [...rules]; nr[i].op = e.target.value; setRules(nr); }}>
+            {["contains", "equals", "matches"].map((o) => <option key={o}>{o}</option>)}
+          </select>
+          <Input list="ownervals" placeholder="value" value={r.value} className="w-52"
+            onChange={(e) => { const nr = [...rules]; nr[i].value = e.target.value; setRules(nr); }} />
+          <span className="text-muted-foreground">→</span>
+          <Input placeholder="tag value" value={r.tagVal} className="w-40"
+            onChange={(e) => { const nr = [...rules]; nr[i].tagVal = e.target.value; setRules(nr); }} />
+          <Button variant="ghost" size="sm" onClick={() => setRules(rules.filter((_, j) => j !== i))}>✕</Button>
+        </div>
+      ))}
+      <datalist id="ownervals">{ownerOpts.map((o) => <option key={o} value={o} />)}</datalist>
+      <div className="flex gap-2">
+        <Button variant="secondary" size="sm" onClick={() => setRules([...rules, { field: "owner", op: "contains", value: "", tagVal: "" }])}>+ Add rule</Button>
+        <Button variant="secondary" size="sm" onClick={doPreview} disabled={preview.isPending}>1️⃣ Show the workloads this will tag</Button>
+      </div>
+      {rows.length > 0 && (
+        <>
+          <div className="max-h-80 overflow-auto rounded-md border">
+            <Table>
+              <TableHeader><TableRow>
+                <TableHead className="w-8"></TableHead><TableHead>Workload</TableHead>
+                <TableHead>Product</TableHead><TableHead>Owner</TableHead>
+                <TableHead className="text-right">Cost</TableHead><TableHead>Set value</TableHead>
+              </TableRow></TableHeader>
+              <TableBody>
+                {rows.map((w, i) => (
+                  <TableRow key={i}>
+                    <TableCell><Checkbox checked={checked[i] ?? true} onCheckedChange={(v) => setChecked({ ...checked, [i]: !!v })} /></TableCell>
+                    <TableCell className="max-w-44 truncate">{String(w.workload_name ?? w.workload_id)}</TableCell>
+                    <TableCell>{String(w.product)}</TableCell>
+                    <TableCell className="text-muted-foreground">{String(w.owner ?? "—")}</TableCell>
+                    <TableCell className="text-right tabular-nums">{money(w.cost)}</TableCell>
+                    <TableCell><Input value={vals[i] ?? ""} className="h-8 w-40"
+                      onChange={(e) => setVals({ ...vals, [i]: e.target.value })} /></TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={dry} onCheckedChange={(v) => setDry(!!v)} /> Dry run only
+          </label>
+          <Button onClick={doApply} disabled={apply.isPending}>2️⃣ Apply tags to the checked workloads</Button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- Manual mode ----------
+function ManualMode({ tagKey, onResult }: ModeProps) {
+  const [f, setF] = useState({ product: "", workload_id: "", workload_name: "", tag_value: "" });
+  const [dry, setDry] = useState(false);
+  const apply = useManualTag();
+  const doApply = async () => {
+    if (!f.product || !f.workload_id || !f.tag_value)
+      return onResult({ kind: "warn", html: "Product, workload id, and tag value are required." });
+    if (!dry && !confirm(`Tag workload ${f.workload_id} for REAL?`)) return;
+    const res = await apply.mutateAsync({
+      product: f.product.toUpperCase(), workload_id: f.workload_id, workload_name: f.workload_name,
+      tag_key: tagKey, tag_value: f.tag_value, dry_run: dry,
+    });
+    const d = res.data;
+    onResult(d.run
+      ? { kind: "info", html: `Batch <b>${d.batch_id}</b> queued, ${dry ? "dry-run" : "LIVE"}: <a class="underline" href="${(d.run as Row).url}" target="_blank">view run →</a>` }
+      : { kind: "warn", html: d.message ?? d.status ?? "Failed" });
+  };
+  return (
+    <div className="space-y-3">
+      <p className="text-sm text-muted-foreground">Tag a single workload with a value you type — no AI, no rules.</p>
+      <div className="flex flex-wrap gap-3">
+        <Input placeholder="Product (e.g. JOBS)" value={f.product} onChange={(e) => setF({ ...f, product: e.target.value })} className="w-40" />
+        <Input placeholder="Workload id" value={f.workload_id} onChange={(e) => setF({ ...f, workload_id: e.target.value })} className="w-64" />
+        <Input placeholder="Name (optional)" value={f.workload_name} onChange={(e) => setF({ ...f, workload_name: e.target.value })} className="w-48" />
+        <Input placeholder="Tag value" value={f.tag_value} onChange={(e) => setF({ ...f, tag_value: e.target.value })} className="w-40" />
+      </div>
+      <label className="flex items-center gap-2 text-sm"><Checkbox checked={dry} onCheckedChange={(v) => setDry(!!v)} /> Dry run only</label>
+      <Button onClick={doApply} disabled={apply.isPending}>Tag this workload</Button>
+    </div>
+  );
+}
+
+// ---------- Not-taggable panel ----------
+const REASON: Record<string, { label: string; color: string; action: string }> = {
+  POLICY_GOVERNED: { label: "Attributed via budget policy (serverless)", color: "border-amber-500",
+    action: "Apps, serverless SQL, model serving, pipelines, Lakebase — assign a budget policy (UI or databricks_budget_policy Terraform), not a per-resource tag." },
+  UI_ONLY: { label: "Set in the pipeline definition", color: "border-sky-500",
+    action: "DLT/SDP tags live in clusters[].custom_tags in the pipeline definition." },
+  NO_API: { label: "No documented tag path", color: "border-red-500",
+    action: "No per-resource tag API or budget-policy coverage documented — check the resource UI." },
+};
+function NotTaggable({ tagKey, days }: { tagKey: string; days: number }) {
+  const { data } = useNotTaggable({ params: { tag_key: tagKey, days } });
+  const rows = (data?.data.rows ?? []) as Row[];
+  if (!rows.length) return null;
+  const groups = rows.reduce<Record<string, Row[]>>((acc, r) => {
+    (acc[String(r.reason)] ||= []).push(r); return acc;
+  }, {});
+  return (
+    <section>
+      <h2 className="mb-3 text-xs font-bold uppercase tracking-wider text-muted-foreground">
+        Tagged a different way <span className="normal-case font-normal">(not a per-resource tag write)</span>
+      </h2>
+      <div className="space-y-3">
+        {Object.entries(groups).map(([reason, grp]) => {
+          const info = REASON[reason] ?? REASON.NO_API;
+          const cost = grp.reduce((s, x) => s + num(x.cost), 0);
+          const wl = grp.reduce((s, x) => s + num(x.workloads), 0);
+          return (
+            <Card key={reason} className={`border-l-4 p-4 ${info.color}`}>
+              <div className="font-semibold">{info.label} — {wl.toLocaleString()} workloads · {money(cost)}</div>
+              <p className="mt-1 text-sm text-muted-foreground">{info.action}</p>
+            </Card>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+// ---------- Batches + live progress + rollback ----------
+function Batches() {
+  const { data, refetch } = useBatches({ params: { limit: 15 }, query: { refetchInterval: 4000 } });
+  const rollback = useRollback();
+  const [links, setLinks] = useState<Record<string, string>>({});
+  const batches = (data?.data.batches ?? []) as Row[];
+
+  const doRollback = async (id: string) => {
+    if (!confirm(`Roll back batch ${id} for REAL? Removes the tags it applied and makes those workloads re-taggable. The bar drains toward 0%.`)) return;
+    const res = await rollback.mutateAsync({ batch_id: id, dry_run: false });
+    const url = (res.data.run as Row | undefined)?.url;
+    if (url) setLinks((l) => ({ ...l, [id]: String(url) }));
+    refetch();
+  };
+
+  return (
+    <section>
+      <h2 className="mb-3 text-xs font-bold uppercase tracking-wider text-muted-foreground">Batches &amp; rollback</h2>
+      <Card className="p-0">
+        <Table>
+          <TableHeader><TableRow>
+            <TableHead>Batch</TableHead><TableHead className="text-right">Cost</TableHead>
+            <TableHead className="w-48">Progress</TableHead><TableHead>Outcome</TableHead><TableHead></TableHead>
+          </TableRow></TableHeader>
+          <TableBody>
+            {batches.map((b) => {
+              const total = num(b.rows);
+              const tagged = num(b.succeeded);
+              const pct = total ? Math.round((100 * tagged) / total) : 0;
+              const parts: string[] = [];
+              if (tagged) parts.push(`${tagged} tagged`);
+              if (num(b.rolled_back)) parts.push(`${num(b.rolled_back)} rolled back`);
+              if (num(b.failed)) parts.push(`${num(b.failed)} failed`);
+              if (num(b.unsupported)) parts.push(`${num(b.unsupported)} can't tag`);
+              if (num(b.pending)) parts.push(`${num(b.pending)} not run yet`);
+              if (num(b.running)) parts.push(`${num(b.running)} running…`);
+              return (
+                <TableRow key={String(b.batch_id)}>
+                  <TableCell><Badge variant="secondary">{String(b.batch_id)}</Badge></TableCell>
+                  <TableCell className="text-right tabular-nums">{money(b.cost)}</TableCell>
+                  <TableCell>
+                    <Progress value={pct} className="h-1.5" />
+                    <span className="text-xs text-muted-foreground">{tagged}/{total} tagged · {pct}%</span>
+                  </TableCell>
+                  <TableCell className="text-sm">{parts.join(" · ") || "—"}</TableCell>
+                  <TableCell className="whitespace-nowrap">
+                    {tagged > 0 && (
+                      <Button variant="secondary" size="sm" onClick={() => doRollback(String(b.batch_id))}>Rollback</Button>
+                    )}
+                    {links[String(b.batch_id)] && (
+                      <a className="ml-2 text-xs underline" href={links[String(b.batch_id)]} target="_blank" rel="noreferrer">view run →</a>
+                    )}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </Card>
+    </section>
+  );
+}

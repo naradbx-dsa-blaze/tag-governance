@@ -1,0 +1,1 @@
+command: ["uvicorn", "tag_governance.backend.app:app", "--workers", "2"]

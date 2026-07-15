@@ -1,0 +1,22 @@
+bundle:
+  name: tag-governance
+
+sync:
+  include:
+    - .build
+
+artifacts:
+  default:
+    build: apx build
+
+resources:
+  apps:
+    tag-governance-app:
+      name: "tag-governance"
+      description: "tag-governance created with apx"
+      source_code_path: ./.build
+
+targets:
+  dev:
+    mode: development
+    default: true
