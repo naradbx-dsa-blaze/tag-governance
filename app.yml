@@ -1,1 +1,14 @@
 command: ["uvicorn", "tag_governance.backend.app:app", "--workers", "2"]
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  - name: TAG_GOVERNANCE_SUMMARY_TABLE
+    value: main.tag_governance.workload_daily
+  - name: TAG_GOVERNANCE_QUEUE_TABLE
+    value: main.tag_governance.write_queue
+  - name: TAG_GOVERNANCE_AUDIT_TABLE
+    value: main.tag_governance.audit
+  - name: TAG_GOVERNANCE_SUGGESTIONS_TABLE
+    value: main.tag_governance.suggestions
+  - name: TAG_GOVERNANCE_ADMIN_GROUP
+    value: "OPEN"
