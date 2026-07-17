@@ -61,7 +61,27 @@ Deploy to Databricks:
 
 ```bash
 databricks bundle deploy -p <your-profile>
+databricks bundle run tag-governance-app -p <your-profile>   # push source to the running app
 ```
+
+### ⚠️ Required one-time grants (or the dashboard shows blank $)
+
+The app runs as its **own service principal**, not as you. That SP needs UC
+read/write on the `tag_governance` schema and `CAN_USE` on the SQL warehouse,
+or every query fails with a 500 and the KPIs come up empty. These objects are
+pre-existing (not bundle-managed), so run the grant script once after deploy:
+
+```bash
+./grant_app_sp.sh <profile> tag-governance main.tag_governance <warehouse_id>
+```
+
+It's idempotent — safe to re-run. Requires an admin/owner identity on the profile.
+
+> **Also**: `app.yml` must contain the `env:` block (including
+> `DATABRICKS_WAREHOUSE_ID: valueFrom: sql-warehouse`). Databricks Apps reads
+> env from `app.yml`, **not** from `databricks.yml`'s `config.env` — if
+> `apx build` ever regenerates `app.yml` without it, the app loses its
+> warehouse and the dashboard goes blank again.
 
 ---
 
