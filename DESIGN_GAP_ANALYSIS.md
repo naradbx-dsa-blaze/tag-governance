@@ -1,5 +1,15 @@
 # Auto-Tagging Platform — Gap Analysis
 
+> **Progress (updated):** Phase 0 ✅ (AWS tag validation `tag_rules.py` + workspace
+> profile), Phase 1a ✅ (declarative capability registry `capability.py` +
+> `/api/capabilities` + UI matrix), Phase 1b ✅ (live scanner `scan_job.py` +
+> `inventory` table + `/api/inventory` + UI panel — verified 6,060 real resources
+> on fe-east). Remaining: Phase 2 (policy/compliance), Phase 3 (approval +
+> exception queue + budget-policy attachment), Phase 4 (snapshot rollback + drift +
+> NFRs). Details unchanged below.
+
+
+
 Maps the target design spec (capability-aware AWS Databricks auto-tagging platform)
 against what the current `tag-governance` app already implements. Verdict per
 requirement: **✅ Have** · **🟡 Partial** · **❌ Missing**. A phased build order follows.
