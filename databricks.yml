@@ -58,6 +58,7 @@ resources:
     tag-governance-refresh:
       name: tag-governance-refresh
       description: "Daily rebuild of the pre-aggregated untagged-workload summary table"
+      performance_target: STANDARD  # background job; PERFORMANCE_OPTIMIZED (the serverless default) is pricier and unneeded here
       schedule:
         quartz_cron_expression: "0 0 6 * * ?"
         timezone_id: "America/New_York"
@@ -76,6 +77,7 @@ resources:
     tag-governance-annotate:
       name: tag-governance-annotate
       description: "Weekly rebuild of advisory ai_query cost-center suggestions"
+      performance_target: STANDARD
       schedule:
         quartz_cron_expression: "0 13 7 ? * MON"
         timezone_id: "America/New_York"
@@ -93,6 +95,7 @@ resources:
     tag-governance-writer:
       name: tag-governance-writer
       description: "Drain the write queue and apply tags (dry-run by default), cost-descending with audit"
+      performance_target: STANDARD
       parameters:
         - name: queue_table
           default: ${var.queue_table}
@@ -135,6 +138,7 @@ resources:
     tag-governance-rollback:
       name: tag-governance-rollback
       description: "Undo a batch by replaying the audit log in reverse"
+      performance_target: STANDARD
       parameters:
         - name: audit_table
           default: ${var.audit_table}
@@ -169,9 +173,14 @@ resources:
           service_principal_name: ${resources.apps.tag-governance-app.service_principal_client_id}
 
 targets:
-  dev:
-    mode: development
+  # fe-east is the stable reference deployment. Production mode = NO "[dev ...]"
+  # name prefix, so the jobs deploy under their plain names (tag-governance-writer,
+  # etc.) — which is exactly the name the app resolves via jobs.py run_now. In dev
+  # mode the prefix split the app's triggers from the deployed code.
+  fe-east:
+    mode: production
     default: true
     workspace:
       host: https://adb-984752964297111.11.azuredatabricks.net
       profile: fe-east
+      root_path: /Workspace/Users/narasimha.kamathardi@databricks.com/.bundle/tag-governance-apx/fe-east

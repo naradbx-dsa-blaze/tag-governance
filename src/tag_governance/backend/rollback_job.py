@@ -20,12 +20,17 @@ from __future__ import annotations
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.runtime import spark
 
 import writer
 import ws_clients
+
+# Flush rollback results every N rows so the app's 2s poll shows the bar
+# draining live rather than jumping at the end. See writer_job.PERSIST_CHUNK.
+PERSIST_CHUNK = 25
 
 
 def _parse_argv() -> dict:
@@ -114,6 +119,38 @@ def run():
 
     audit_rows: list[dict] = []
 
+    # Persist rollback results INCREMENTALLY (in chunks) as rows finish, so the
+    # app's 2s poll shows the progress bar draining toward 0% live instead of
+    # jumping at the very end. A lock serializes the audit-append + queue MERGE so
+    # concurrent workspace threads don't hit a Delta ConcurrentAppend conflict.
+    persist_lock = Lock()
+    pending: list[dict] = []
+
+    def flush(force: bool = False):
+        nonlocal pending
+        with persist_lock:
+            if not force and len(pending) < PERSIST_CHUNK:
+                return
+            batch, pending = pending, []
+            if batch and not dry_run:
+                _persist_rollback_audit(audit_table, batch)
+                # Mark successfully-restored rows ROLLED_BACK so the UI shows the
+                # batch reverting AND the double-tag guard (blocks only
+                # SUCCEEDED/PENDING/RUNNING) lets these workloads be tagged again.
+                if queue_table:
+                    ok = [(a["workload_id"], a["tag_key"]) for a in batch
+                          if a["status"] == "SUCCEEDED"]
+                    if ok:
+                        _mark_rolled_back(queue_table, batch_id, ok)
+
+    def collect(rows: list[dict]):
+        with persist_lock:
+            pending.extend(rows)
+            ready = len(pending) >= PERSIST_CHUNK
+        audit_rows.extend(rows)
+        if ready:
+            flush()
+
     def process_workspace(workspace_id: str, rows: list[dict]):
         # In dry-run we don't need a client at all (no mutation). For live rollback,
         # resolve the workspace client; if it can't be built, fail those rows.
@@ -122,11 +159,11 @@ def run():
             try:
                 client = resolver.client_for(workspace_id)
             except Exception as e:  # noqa: BLE001
-                return [_audit_row(batch_id, executed_by, r, r["old_value"],
-                                   status="FAILED",
-                                   error=f"no client for workspace {workspace_id}: {e}")
-                        for r in rows]
-        local = []
+                collect([_audit_row(batch_id, executed_by, r, r["old_value"],
+                                    status="FAILED",
+                                    error=f"no client for workspace {workspace_id}: {e}")
+                         for r in rows])
+                return
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {}
             for row in rows:
@@ -134,8 +171,8 @@ def run():
                 target = row["old_value"]
                 if dry_run:
                     # DRY_RUN status so a dry run is not mistaken for a real restore.
-                    local.append(_audit_row(batch_id, executed_by, row, target,
-                                            status="DRY_RUN", error=None))
+                    collect([_audit_row(batch_id, executed_by, row, target,
+                                        status="DRY_RUN", error=None)])
                     continue
                 # is_serverless defaults False, which is always correct here: only
                 # a SUCCEEDED SET is rolled back, and serverless SQL/Apps never
@@ -147,28 +184,17 @@ def run():
             for fut in as_completed(futures):
                 row = futures[fut]
                 result = fut.result()
-                local.append(_audit_row(
+                collect([_audit_row(
                     batch_id, executed_by, row, row["old_value"],
                     status="SUCCEEDED" if result.status == "SUCCEEDED" else "FAILED",
-                    error=result.error))
-        return local
+                    error=result.error)])
 
     with ThreadPoolExecutor(max_workers=min(len(by_ws), 14)) as ws_pool:
         futs = {ws_pool.submit(process_workspace, ws, rows): ws
                 for ws, rows in by_ws.items()}
         for fut in as_completed(futs):
-            audit_rows.extend(fut.result())
-
-    if audit_rows and not dry_run:
-        _persist_rollback_audit(audit_table, audit_rows)
-        # Mark the successfully-rolled-back queue rows ROLLED_BACK, so the UI shows
-        # the batch as reverted AND the double-tag guard (which only blocks
-        # SUCCEEDED/PENDING/RUNNING) lets these workloads be tagged again.
-        if queue_table:
-            ok = [(a["workload_id"], a["tag_key"]) for a in audit_rows
-                  if a["status"] == "SUCCEEDED"]
-            if ok:
-                _mark_rolled_back(queue_table, batch_id, ok)
+            fut.result()  # surface exceptions; results already streamed via collect()
+    flush(force=True)  # persist the remainder
 
     counts: dict[str, int] = {}
     for a in audit_rows:

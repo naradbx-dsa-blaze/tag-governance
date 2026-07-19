@@ -488,18 +488,33 @@ function Batches() {
               const id = String(b.batch_id);
               const total = num(b.rows);
               const tagged = num(b.succeeded);
-              const pct = total ? Math.round((100 * tagged) / total) : 0;
-              // Clear the transient "rolling back…" note once the batch has drained.
-              if (busy[id] && tagged === 0 && num(b.rolled_back) > 0) {
+              const rolledBack = num(b.rolled_back);
+              const pending = num(b.pending);
+              const running = num(b.running);
+              const inFlight = pending > 0 || running > 0;
+              // A rollback drains `tagged` toward 0. Show progress as the fraction
+              // reverted out of what was ever tagged (tagged + rolled_back), so the
+              // bar visibly empties as rows flip SUCCEEDED -> ROLLED_BACK live.
+              const everTagged = tagged + rolledBack;
+              const rollbackMode = rolledBack > 0 || (busy[id] && everTagged > 0);
+              const pct = rollbackMode
+                ? (everTagged ? Math.round((100 * rolledBack) / everTagged) : 100)
+                : (total ? Math.round((100 * tagged) / total) : 0);
+              // Clear the "rolling back…" note once the run is no longer in flight.
+              // (Do NOT wait for tagged===0 — removals can legitimately fail when a
+              // resource was deleted, leaving some rows tagged forever.)
+              if (busy[id] && !inFlight && rolledBack > 0) {
                 queueMicrotask(() => setBusy((x) => { const n = { ...x }; delete n[id]; return n; }));
               }
               const parts: string[] = [];
               if (tagged) parts.push(`${tagged} tagged`);
-              if (num(b.rolled_back)) parts.push(`${num(b.rolled_back)} rolled back`);
+              if (rolledBack) parts.push(`${rolledBack} rolled back`);
               if (num(b.failed)) parts.push(`${num(b.failed)} failed`);
               if (num(b.unsupported)) parts.push(`${num(b.unsupported)} can't tag`);
-              if (num(b.pending)) parts.push(`${num(b.pending)} not run yet`);
-              if (num(b.running)) parts.push(`${num(b.running)} running…`);
+              if (pending) parts.push(`${pending} not run yet`);
+              if (running) parts.push(`${running} running…`);
+              // Honest note when a rollback couldn't fully revert.
+              const residual = rolledBack > 0 && tagged > 0 && !inFlight;
               return (
                 <TableRow key={id}>
                   <TableCell><Badge variant="secondary">{id}</Badge></TableCell>
@@ -507,8 +522,16 @@ function Batches() {
                   <TableCell>
                     <Progress value={pct} className="h-1.5" />
                     <span className="text-xs text-muted-foreground">
-                      {tagged}/{total} tagged · {pct}%{busy[id] ? ` · ${busy[id]}` : ""}
+                      {rollbackMode
+                        ? `${rolledBack}/${everTagged} reverted · ${pct}%`
+                        : `${tagged}/${total} tagged · ${pct}%`}
+                      {busy[id] ? ` · ${busy[id]}` : ""}
                     </span>
+                    {residual && (
+                      <span className="block text-xs text-amber-600">
+                        {tagged} couldn’t be removed (resource deleted or removal failed)
+                      </span>
+                    )}
                   </TableCell>
                   <TableCell className="text-sm">{parts.join(" · ") || "—"}</TableCell>
                   <TableCell className="whitespace-nowrap">

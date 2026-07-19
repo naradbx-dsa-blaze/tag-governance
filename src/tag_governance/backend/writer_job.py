@@ -28,6 +28,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.runtime import spark  # available in the job runtime
@@ -38,6 +39,11 @@ import ws_clients
 # Backoff for rate limits (HTTP 429 / "rate limit" in the message).
 _MAX_RETRIES = 5
 _BASE_DELAY = 2.0  # seconds; doubled each retry
+
+# Flush status back to the queue every N completed rows so the app's 2s poll
+# shows the bar filling/draining live. Small enough to feel real-time on the
+# demo (a few dozen rows), large enough that each MERGE isn't a per-row round-trip.
+PERSIST_CHUNK = 25
 
 
 def _parse_argv() -> dict:
@@ -256,7 +262,7 @@ def run():
     audit_rows: list[dict] = []
     queue_updates: list[dict] = []  # (batch_id, workload_id, tag_key) -> status/error
 
-    def process_workspace(workspace_id: str, rows: list[dict]):
+    def process_workspace(workspace_id: str, rows: list[dict], collect):
         # Resolve the workspace client once per workspace. If it can't be built
         # (M1 foreign workspace, or SP not assigned there), fail this workspace's
         # rows cleanly instead of crashing the run or mis-tagging via home.
@@ -264,29 +270,30 @@ def run():
             client = resolver.client_for(workspace_id)
         except Exception as e:  # noqa: BLE001
             reason = f"no client for workspace {workspace_id}: {e}"
-            return [], [{
+            collect([], [{
                 "batch_id": r["batch_id"], "workload_id": r["workload_id"],
                 "product": r["product"], "tag_key": r["tag_key"],
                 "status": "FAILED", "last_error": reason,
-            } for r in rows]
-        local_audit, local_updates = [], []
+            } for r in rows])
+            return
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_apply_row, client, row, dry_run): row for row in rows}
             for fut in as_completed(futures):
                 row = futures[fut]
                 result = fut.result()
                 status = _status_for(result)
-                local_updates.append({
+                update = {
                     "batch_id": row["batch_id"], "workload_id": row["workload_id"],
                     "product": row["product"], "tag_key": row["tag_key"],
                     "status": status, "last_error": result.error,
-                })
+                }
                 # Audit only ACTUAL changes: a live SET that ran, or a real FAILURE.
                 # Dry-run "would-be" writes (result.dry_run) are not persisted —
                 # the audit table is a truthful record of what happened, not intent.
                 real_change = (result.status == "SUCCEEDED" and not result.dry_run and not result.noop)
+                audit = []
                 if real_change or result.status == "FAILED":
-                    local_audit.append({
+                    audit.append({
                         "audit_id": str(uuid.uuid4()), "batch_id": row["batch_id"],
                         "executed_by": executed_by, "workspace_id": workspace_id,
                         "product": row["product"], "workload_id": row["workload_id"],
@@ -296,17 +303,49 @@ def run():
                         "status": "SUCCEEDED" if real_change else "FAILED",
                         "error": result.error,
                     })
-        return local_audit, local_updates
+                # Stream each row's result out immediately so it can be flushed to
+                # the queue in chunks (live progress) rather than buffered to the end.
+                collect(audit, [update])
+
+    # Persist status back to the queue INCREMENTALLY (in chunks) as rows finish,
+    # not once at the very end. The app polls the queue every 2s, so flushing in
+    # chunks makes the progress bar fill/drain in near-real-time instead of jumping
+    # from 0% to 100% when the whole job returns. This is the SAME writer job for
+    # AI, rule, and manual tagging (all three enqueue into one queue), so every mode
+    # gets live progress. A lock serializes the MERGEs so concurrent workspace
+    # threads can't hit a Delta ConcurrentAppend conflict on the queue table.
+    persist_lock = Lock()
+    pending_audit: list[dict] = []
+    pending_updates: list[dict] = []
+
+    def flush(force: bool = False):
+        nonlocal pending_audit, pending_updates
+        with persist_lock:
+            if not force and len(pending_updates) < PERSIST_CHUNK:
+                return
+            a, u = pending_audit, pending_updates
+            pending_audit, pending_updates = [], []
+            if a or u:
+                # _persist signature is (queue_table, audit_table, queue_updates,
+                # audit_rows, dry_run) — updates 3rd, audit 4th. Keep this order.
+                _persist(queue_table, audit_table, u, a, dry_run)
+
+    def collect(a: list[dict], u: list[dict]):
+        with persist_lock:
+            pending_audit.extend(a)
+            pending_updates.extend(u)
+            ready = len(pending_updates) >= PERSIST_CHUNK
+        audit_rows.extend(a)
+        queue_updates.extend(u)
+        if ready:
+            flush()
 
     with ThreadPoolExecutor(max_workers=min(len(by_ws), 14)) as ws_pool:
-        ws_futures = {ws_pool.submit(process_workspace, ws, rows): ws
+        ws_futures = {ws_pool.submit(process_workspace, ws, rows, collect): ws
                       for ws, rows in by_ws.items()}
         for fut in as_completed(ws_futures):
-            a, u = fut.result()
-            audit_rows.extend(a)
-            queue_updates.extend(u)
-
-    _persist(queue_table, audit_table, queue_updates, audit_rows, dry_run)
+            fut.result()  # surface exceptions; results already streamed via collect()
+    flush(force=True)  # persist the remainder
 
     summary = _summarize(queue_updates)
     print(f"Done. {summary}")
