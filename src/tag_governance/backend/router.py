@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import uuid
 
 from fastapi import Request
@@ -20,13 +19,13 @@ import authz
 import db
 import jobs
 import queries
+import tag_rules
 import tagging
 
 log = logging.getLogger("tag_governance.router")
 router = create_router()
 
 DEFAULT_DAYS = int(os.environ.get("TAG_GOVERNANCE_DAYS", "30"))
-_TAG_RE = re.compile(r"^[A-Za-z0-9 +\-=._:/@]{1,255}$")
 
 
 class BadInput(Exception):
@@ -34,10 +33,13 @@ class BadInput(Exception):
 
 
 def _validate_tag(key: str, value: str):
-    if not key or not _TAG_RE.match(key):
-        raise BadInput(f"Invalid tag key {key!r}: allowed A-Z a-z 0-9 space +-=._:/@, max 255.")
-    if value is None or not _TAG_RE.match(value):
-        raise BadInput(f"Invalid tag value {value!r}: allowed A-Z a-z 0-9 space +-=._:/@, max 255.")
+    """Validate one key/value pair against the AWS resource-tag rules
+    (key 1-127, value 0-255, UTF-8, no reserved prefixes). Empty value is
+    valid; None is not (removal goes through the rollback path)."""
+    try:
+        tag_rules.validate_pair(key, value, tag_rules.RESOURCE_TAGS)
+    except tag_rules.TagValidationError as e:
+        raise BadInput(str(e)) from e
 
 
 def _err(e: Exception, status: int = 500) -> JSONResponse:

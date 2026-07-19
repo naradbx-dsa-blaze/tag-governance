@@ -151,27 +151,37 @@ function Overview({ tagKey, days }: { tagKey: string; days: number }) {
         </p>
       </div>
       {products.length > 0 && (
-        <Card className="mt-4 p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Product</TableHead>
-                <TableHead className="text-right">Untagged</TableHead>
-                <TableHead className="text-right">Total</TableHead>
-                <TableHead className="text-right">% untagged</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {products.map((p, i) => (
-                <TableRow key={i}>
-                  <TableCell>{String(p.product)}</TableCell>
-                  <TableCell className="text-right tabular-nums">{money(p.untagged_cost)}</TableCell>
-                  <TableCell className="text-right tabular-nums">{money(p.total_cost)}</TableCell>
-                  <TableCell className="text-right tabular-nums">{String(p.pct_untagged)}%</TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+        <Card className="mt-4 p-5">
+          <div className="mb-3 flex items-baseline justify-between">
+            <h3 className="text-sm font-semibold">Untagged spend by product</h3>
+            <span className="text-xs text-muted-foreground">ranked by untagged cost</span>
+          </div>
+          <div className="space-y-2.5">
+            {(() => {
+              const sorted = [...products].sort(
+                (a, b) => num(b.untagged_cost) - num(a.untagged_cost));
+              const max = num(sorted[0]?.untagged_cost) || 1;
+              return sorted.map((p, i) => {
+                const untagged = num(p.untagged_cost);
+                const pct = num(p.pct_untagged);
+                const w = Math.max(2, Math.round((100 * untagged) / max));
+                // Hotter color = more fully-untagged (higher risk).
+                const bar = pct >= 95 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-sky-500";
+                return (
+                  <div key={i} className="grid grid-cols-[9rem_1fr_5.5rem_3rem] items-center gap-3">
+                    <span className="truncate text-sm font-medium" title={String(p.product)}>
+                      {String(p.product)}
+                    </span>
+                    <div className="h-5 overflow-hidden rounded bg-muted/40">
+                      <div className={`h-full ${bar} transition-all`} style={{ width: `${w}%` }} />
+                    </div>
+                    <span className="text-right text-sm tabular-nums">{money(untagged)}</span>
+                    <span className="text-right text-xs tabular-nums text-muted-foreground">{pct}%</span>
+                  </div>
+                );
+              });
+            })()}
+          </div>
         </Card>
       )}
     </section>
