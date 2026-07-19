@@ -375,6 +375,58 @@ export function useFieldValuesSuspense<TData = {
         ...options?.query
     });
 }
+export const inventory = async (options?: RequestInit): Promise<{
+    data: RowsOut;
+}> =>{
+    const res = await fetch("/api/inventory", {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const inventoryKey = ()=>{
+    return [
+        "/api/inventory"
+    ] as const;
+};
+export function useInventory<TData = {
+    data: RowsOut;
+}>(options?: {
+    query?: Omit<UseQueryOptions<{
+        data: RowsOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: inventoryKey(),
+        queryFn: ()=>inventory(),
+        ...options?.query
+    });
+}
+export function useInventorySuspense<TData = {
+    data: RowsOut;
+}>(options?: {
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: RowsOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: inventoryKey(),
+        queryFn: ()=>inventory(),
+        ...options?.query
+    });
+}
 export const manualTag = async (data: ManualTagBody, options?: RequestInit): Promise<{
     data: RunOut;
 }> =>{

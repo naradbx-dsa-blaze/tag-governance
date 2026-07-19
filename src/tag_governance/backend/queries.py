@@ -33,6 +33,7 @@ SUMMARY_TABLE = _table_env("TAG_GOVERNANCE_SUMMARY_TABLE")
 QUEUE_TABLE = _table_env("TAG_GOVERNANCE_QUEUE_TABLE")
 AUDIT_TABLE = _table_env("TAG_GOVERNANCE_AUDIT_TABLE")
 SUGGESTIONS_TABLE = _table_env("TAG_GOVERNANCE_SUGGESTIONS_TABLE")
+INVENTORY_TABLE = _table_env("TAG_GOVERNANCE_INVENTORY_TABLE")
 
 # tag_keys aggregated up from the daily rows of one workload
 _AGG_KEYS = "array_distinct(flatten(collect_list(tag_keys)))"
@@ -940,4 +941,40 @@ SELECT
   0                         AS attempts
 FROM cand
 WHERE 1=1{exclude}
+"""
+
+
+# --------------------------------------------------------------------- inventory (Phase 1 live scan)
+def inventory_summary():
+    """Per-product rollup of the LATEST live scan: total resources, how many are
+    truly untagged (deep read succeeded and tag_count=0), and how many reads
+    failed (state unknown, not counted as untagged). Reads the most recent
+    scan_id only, so stale scans don't mix in."""
+    return f"""
+WITH latest AS (
+  SELECT max(scan_id) AS scan_id FROM {INVENTORY_TABLE}
+)
+SELECT i.product,
+       count(*)                                                       AS resources,
+       sum(CASE WHEN i.tag_read_ok AND i.tag_count = 0 THEN 1 ELSE 0 END) AS untagged,
+       sum(CASE WHEN i.tag_count > 0 THEN 1 ELSE 0 END)               AS tagged,
+       sum(CASE WHEN NOT i.tag_read_ok THEN 1 ELSE 0 END)             AS read_failed,
+       max(i.fallback)                                                AS fallback
+FROM {INVENTORY_TABLE} i
+JOIN latest l ON i.scan_id = l.scan_id
+WHERE i.workload_id NOT LIKE '\\_\\_%'          -- exclude sentinel error rows
+GROUP BY i.product
+ORDER BY resources DESC
+"""
+
+
+def inventory_meta():
+    """Latest scan id + when it ran + total resources, for the UI header."""
+    return f"""
+WITH latest AS (SELECT max(scan_id) AS scan_id FROM {INVENTORY_TABLE})
+SELECT l.scan_id,
+       max(i.scanned_at) AS scanned_at,
+       count(*)          AS resources
+FROM {INVENTORY_TABLE} i JOIN latest l ON i.scan_id = l.scan_id
+GROUP BY l.scan_id
 """

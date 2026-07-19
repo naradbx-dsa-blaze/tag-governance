@@ -10,5 +10,7 @@ env:
     value: main.tag_governance.audit
   - name: TAG_GOVERNANCE_SUGGESTIONS_TABLE
     value: main.tag_governance.suggestions
+  - name: TAG_GOVERNANCE_INVENTORY_TABLE
+    value: main.tag_governance.inventory
   - name: TAG_GOVERNANCE_ADMIN_GROUP
     value: "OPEN"

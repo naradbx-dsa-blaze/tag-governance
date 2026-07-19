@@ -59,3 +59,33 @@ CREATE TABLE IF NOT EXISTS IDENTIFIER(:audit_table) (
 )
 USING DELTA
 COMMENT 'Tag Governance audit log — old->new for every applied change, enables rollback';
+
+-- ---------------------------------------------------------------------------
+-- Inventory: the LIVE asset scan (Phase 1). Distinct from the billing-derived
+-- workload_daily summary — this is enumerated from the resource list APIs
+-- (jobs/clusters/warehouses/pipelines/serving + workspaces) with a DEEP read of
+-- each resource's ACTUAL current tag state. List APIs don't always return full
+-- tags, so the scanner reads per-resource where needed. One row per live
+-- resource per scan; scan_id groups a full sweep. This is what compliance
+-- classification and remediation planning read (billing tells you COST; this
+-- tells you TRUTH about tags).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS IDENTIFIER(:inventory_table) (
+  scan_id        STRING    NOT NULL COMMENT 'Groups one full sweep',
+  scanned_at     TIMESTAMP NOT NULL COMMENT 'When this resource was read',
+  workspace_id   STRING    NOT NULL COMMENT 'Workspace the resource lives in',
+  product        STRING    NOT NULL COMMENT 'Capability-registry product key (JOBS/ALL_PURPOSE/...)',
+  workload_id    STRING    NOT NULL COMMENT 'Concrete resource id',
+  workload_name  STRING             COMMENT 'Human-readable name',
+  owner          STRING             COMMENT 'Creator/owner if the API exposes it',
+  tags           MAP<STRING,STRING> COMMENT 'ACTUAL current tags read from the resource',
+  tag_keys       ARRAY<STRING>      COMMENT 'Keys of tags, for fast untagged checks',
+  tag_count      INT                COMMENT 'Number of tags currently on the resource',
+  direct_tag     BOOLEAN            COMMENT 'From capability registry: has a direct tag write API',
+  fallback       STRING             COMMENT 'Remediation pattern (DIRECT/BUDGET_POLICY/UI_ONLY/...)',
+  tag_read_ok    BOOLEAN            COMMENT 'FALSE if the deep tag read failed (state is unknown, not empty)',
+  read_error     STRING             COMMENT 'Why the tag read failed, if any',
+  raw_state      STRING             COMMENT 'Optional JSON snapshot for drift/debug'
+)
+USING DELTA
+COMMENT 'Tag Governance live asset inventory — enumerated from list APIs with deep tag reads';

@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import {
   useOverview, useAiPreview, useBatches, useNotTaggable, useCapabilities,
-  useRulePreview, useTagSelected, useManualTag, useRollback,
+  useInventory, useRulePreview, useTagSelected, useManualTag, useRollback,
   fieldValues,
 } from "@/lib/api";
 import { Card } from "@/components/ui/card";
@@ -105,11 +105,88 @@ function App() {
           </Card>
         </section>
 
+        <LiveInventory />
         <NotTaggable tagKey={c.tagKey} days={c.days} />
         <CapabilityMatrix />
         <Batches />
       </main>
     </div>
+  );
+}
+
+// ---------- Live asset inventory (Phase 1 scan — ground-truth tag state) ----------
+function LiveInventory() {
+  const { data } = useInventory();
+  const rows = (data?.data.rows ?? []) as Row[];
+  const meta = rows.find((r) => r.product === "__meta__");
+  const products = rows.filter((r) => r.product !== "__meta__");
+  if (!products.length) {
+    return (
+      <section>
+        <h2 className="mb-3 text-xs font-bold uppercase tracking-wider text-muted-foreground">
+          Live asset inventory
+        </h2>
+        <Card className="p-5 text-sm text-muted-foreground">
+          No scan yet. Run the <code className="rounded bg-muted px-1">tag-governance-scan</code> job
+          to enumerate live resources and read their true tag state.
+        </Card>
+      </section>
+    );
+  }
+  const totalRes = products.reduce((s, p) => s + num(p.resources), 0);
+  const totalUntagged = products.reduce((s, p) => s + num(p.untagged), 0);
+  const when = meta?.scanned_at ? new Date(String(meta.scanned_at)).toLocaleString() : "";
+
+  return (
+    <section>
+      <div className="mb-3 flex items-baseline justify-between">
+        <h2 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+          Live asset inventory
+        </h2>
+        <span className="text-xs text-muted-foreground">
+          {totalRes.toLocaleString()} resources · {totalUntagged.toLocaleString()} untagged
+          {when ? ` · scanned ${when}` : ""}
+        </span>
+      </div>
+      <Card className="p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Product</TableHead>
+              <TableHead className="text-right">Resources</TableHead>
+              <TableHead className="text-right">Untagged</TableHead>
+              <TableHead className="text-right">Tagged</TableHead>
+              <TableHead className="w-40">Coverage</TableHead>
+              <TableHead className="text-right">Read failed</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {products.map((p, i) => {
+              const res = num(p.resources);
+              const tagged = num(p.tagged);
+              const cov = res ? Math.round((100 * tagged) / res) : 0;
+              return (
+                <TableRow key={i}>
+                  <TableCell className="font-medium">{String(p.product)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{res.toLocaleString()}</TableCell>
+                  <TableCell className="text-right tabular-nums">{num(p.untagged).toLocaleString()}</TableCell>
+                  <TableCell className="text-right tabular-nums">{tagged.toLocaleString()}</TableCell>
+                  <TableCell>
+                    <Progress value={cov} className="h-1.5" />
+                    <span className="text-xs text-muted-foreground">{cov}% tagged</span>
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {num(p.read_failed) > 0
+                      ? <span className="text-amber-600">{num(p.read_failed)}</span>
+                      : "—"}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </Card>
+    </section>
   );
 }
 

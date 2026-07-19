@@ -21,6 +21,8 @@ variables:
     default: main.tag_governance.audit
   suggestions_table:
     default: main.tag_governance.suggestions
+  inventory_table:
+    default: main.tag_governance.inventory
   annotate_model:
     default: databricks-meta-llama-3-3-70b-instruct
   account_sp_scope:
@@ -51,6 +53,8 @@ resources:
             value: ${var.audit_table}
           - name: TAG_GOVERNANCE_SUGGESTIONS_TABLE
             value: ${var.suggestions_table}
+          - name: TAG_GOVERNANCE_INVENTORY_TABLE
+            value: ${var.inventory_table}
           - name: TAG_GOVERNANCE_ADMIN_GROUP
             value: ${var.admin_group}
 
@@ -161,6 +165,43 @@ resources:
               - queue_table={{job.parameters.queue_table}}
               - batch_id={{job.parameters.batch_id}}
               - dry_run={{job.parameters.dry_run}}
+              - max_workers={{job.parameters.max_workers}}
+              - account_sp_scope={{job.parameters.account_sp_scope}}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+      permissions:
+        - level: CAN_MANAGE_RUN
+          service_principal_name: ${resources.apps.tag-governance-app.service_principal_client_id}
+
+    tag-governance-scan:
+      name: tag-governance-scan
+      description: "Live asset scan — enumerate resources via list APIs + deep tag reads into the inventory table"
+      performance_target: STANDARD
+      parameters:
+        - name: inventory_table
+          default: ${var.inventory_table}
+        - name: workspace_id
+          default: ""
+        - name: scan_id
+          default: ""
+        - name: products
+          default: ""
+        - name: max_workers
+          default: "8"
+        - name: account_sp_scope
+          default: ${var.account_sp_scope}
+      tasks:
+        - task_key: scan_assets
+          spark_python_task:
+            python_file: ./src/tag_governance/backend/scan_job.py
+            parameters:
+              - inventory_table={{job.parameters.inventory_table}}
+              - workspace_id={{job.parameters.workspace_id}}
+              - scan_id={{job.parameters.scan_id}}
+              - products={{job.parameters.products}}
               - max_workers={{job.parameters.max_workers}}
               - account_sp_scope={{job.parameters.account_sp_scope}}
           environment_key: default

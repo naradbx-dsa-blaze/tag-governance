@@ -85,6 +85,26 @@ def capabilities():
     return RowsOut(rows=capability.matrix())
 
 
+@router.get("/inventory", response_model=RowsOut, operation_id="inventory")
+def inventory():
+    """Per-product rollup of the latest LIVE asset scan (ground-truth tag state
+    read from the resource APIs), plus a meta header row. Distinct from the
+    billing-derived overview: this counts real resources and their actual tags.
+    Returns {rows: [...]} with a leading meta row (product='__meta__')."""
+    try:
+        summary = db.run_query(queries.inventory_summary())
+        meta = db.run_query(queries.inventory_meta())
+        rows = []
+        if meta:
+            m = dict(meta[0]); m["product"] = "__meta__"
+            rows.append(m)
+        rows.extend(summary)
+        return RowsOut(rows=rows)
+    except Exception as e:  # noqa: BLE001 — inventory may be empty before first scan
+        log.info("inventory read failed (no scan yet?): %s", e)
+        return RowsOut(rows=[])
+
+
 # --------------------------------------------------------------------- reads
 @router.get("/overview", response_model=OverviewOut, operation_id="overview")
 def overview(days: int = DEFAULT_DAYS, tag_key: str = "cost_center"):
