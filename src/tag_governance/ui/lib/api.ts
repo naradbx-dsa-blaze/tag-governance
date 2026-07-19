@@ -259,6 +259,58 @@ export function useBatchesSuspense<TData = {
         ...options?.query
     });
 }
+export const capabilities = async (options?: RequestInit): Promise<{
+    data: RowsOut;
+}> =>{
+    const res = await fetch("/api/capabilities", {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const capabilitiesKey = ()=>{
+    return [
+        "/api/capabilities"
+    ] as const;
+};
+export function useCapabilities<TData = {
+    data: RowsOut;
+}>(options?: {
+    query?: Omit<UseQueryOptions<{
+        data: RowsOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: capabilitiesKey(),
+        queryFn: ()=>capabilities(),
+        ...options?.query
+    });
+}
+export function useCapabilitiesSuspense<TData = {
+    data: RowsOut;
+}>(options?: {
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: RowsOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: capabilitiesKey(),
+        queryFn: ()=>capabilities(),
+        ...options?.query
+    });
+}
 export interface FieldValuesParams {
     field?: string;
     days?: number;

@@ -16,6 +16,7 @@ from .models import (
 
 # The framework-agnostic logic modules (siblings on sys.path via __init__).
 import authz
+import capability
 import db
 import jobs
 import queries
@@ -73,6 +74,15 @@ def whoami(request: Request):
                      display_name=h.get("x-forwarded-preferred-username"),
                      can_write=ok, reason=reason,
                      admin_group=authz.ADMIN_GROUP or "(open — dev mode)")
+
+
+@router.get("/capabilities", response_model=RowsOut, operation_id="capabilities")
+def capabilities():
+    """The resource capability matrix: for each product, its read/write path,
+    direct-tag / create-time / policy / UI flags, rollback support, and the
+    fallback pattern. Single source of truth (capability.py) — the UI renders
+    this so the tag-ability story is never hand-maintained in two places."""
+    return RowsOut(rows=capability.matrix())
 
 
 # --------------------------------------------------------------------- reads

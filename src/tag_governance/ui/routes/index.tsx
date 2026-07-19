@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import {
-  useOverview, useAiPreview, useBatches, useNotTaggable,
+  useOverview, useAiPreview, useBatches, useNotTaggable, useCapabilities,
   useRulePreview, useTagSelected, useManualTag, useRollback,
   fieldValues,
 } from "@/lib/api";
@@ -106,9 +106,88 @@ function App() {
         </section>
 
         <NotTaggable tagKey={c.tagKey} days={c.days} />
+        <CapabilityMatrix />
         <Batches />
       </main>
     </div>
+  );
+}
+
+// ---------- Capability matrix (declarative registry from the backend) ----------
+function CapabilityMatrix() {
+  const [open, setOpen] = useState(false);
+  const { data } = useCapabilities();
+  const rows = (data?.data.rows ?? []) as Row[];
+  if (!rows.length) return null;
+
+  const yn = (v: unknown) => (v ? "✓" : "—");
+  const fallbackLabel: Record<string, string> = {
+    DIRECT: "Direct API",
+    BUDGET_POLICY: "Budget policy",
+    CREATE_TIME: "Create-time only",
+    UI_ONLY: "Edit in UI",
+    EXCEPTION_QUEUE: "Exception queue",
+  };
+  const fallbackColor: Record<string, string> = {
+    DIRECT: "bg-emerald-500/15 text-emerald-600",
+    BUDGET_POLICY: "bg-sky-500/15 text-sky-600",
+    CREATE_TIME: "bg-violet-500/15 text-violet-600",
+    UI_ONLY: "bg-amber-500/15 text-amber-600",
+    EXCEPTION_QUEUE: "bg-red-500/15 text-red-600",
+  };
+
+  return (
+    <section>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-muted-foreground hover:text-foreground"
+      >
+        <span>{open ? "▾" : "▸"}</span> Capability matrix
+        <span className="font-normal normal-case tracking-normal">
+          — how each product can be tagged
+        </span>
+      </button>
+      {open && (
+        <Card className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Product</TableHead>
+                <TableHead className="text-center">Direct tag</TableHead>
+                <TableHead className="text-center">Policy</TableHead>
+                <TableHead className="text-center">UI-only</TableHead>
+                <TableHead className="text-center">Rollback</TableHead>
+                <TableHead>Remediation</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((r, i) => (
+                <TableRow key={i}>
+                  <TableCell>
+                    <div className="font-medium">{String(r.label)}</div>
+                    {r.reason ? (
+                      <div className="mt-0.5 max-w-md text-xs text-muted-foreground">
+                        {String(r.reason)}
+                      </div>
+                    ) : null}
+                  </TableCell>
+                  <TableCell className="text-center tabular-nums">{yn(r.direct_tag)}</TableCell>
+                  <TableCell className="text-center tabular-nums">{yn(r.policy_driven)}</TableCell>
+                  <TableCell className="text-center tabular-nums">{yn(r.ui_only)}</TableCell>
+                  <TableCell className="text-center tabular-nums">{yn(r.rollback)}</TableCell>
+                  <TableCell>
+                    <span className={`rounded px-2 py-0.5 text-xs font-medium ${
+                      fallbackColor[String(r.fallback)] ?? "bg-muted"}`}>
+                      {fallbackLabel[String(r.fallback)] ?? String(r.fallback)}
+                    </span>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
+    </section>
   );
 }
 

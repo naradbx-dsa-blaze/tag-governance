@@ -37,12 +37,14 @@ SUGGESTIONS_TABLE = _table_env("TAG_GOVERNANCE_SUGGESTIONS_TABLE")
 # tag_keys aggregated up from the daily rows of one workload
 _AGG_KEYS = "array_distinct(flatten(collect_list(tag_keys)))"
 
-# Products that CANNOT take a per-resource custom_tags write — they attribute cost
-# via a budget/tag policy instead. This MUST mirror writer.POLICY_GOVERNED_REASON /
-# writer.attempt_write, or the app will promise tags the writer can't apply (and
-# the workload reappears forever). Serverless SQL is policy-governed too, but
-# non-serverless SQL warehouses are taggable, so SQL is handled by the flag.
-_POLICY_GOVERNED_PRODUCTS = ("APPS", "AI_GATEWAY", "INTERACTIVE", "LAKEFLOW_CONNECT")
+# Capability facts (which products are policy-governed vs API-taggable) come from
+# the declarative registry in capability.py — the SINGLE source of truth shared
+# with writer.py. Previously duplicated here and could drift out of sync.
+import capability  # noqa: E402
+
+# Always-policy-governed products (excludes SQL, which is only policy-governed when
+# serverless — handled by the is_serverless flag below).
+_POLICY_GOVERNED_PRODUCTS = capability.policy_governed_products()
 
 
 def _taggable_predicate(product_col="product", serverless_col="is_serverless"):
@@ -56,14 +58,15 @@ def _taggable_predicate(product_col="product", serverless_col="is_serverless"):
             f"AND NOT ({product_col} = 'SQL' AND {serverless_col} = 1))")
 
 
-# Products with a working per-resource tag WRITER (mirror writer._WRITERS, minus
-# the ones whose writer always returns UNSUPPORTED). Keep in sync with writer.py.
-#   - JOBS/ALL_PURPOSE/MODEL_SERVING/LAKEBASE/VECTOR_SEARCH/DATABASE: real API write
-#     (LAKEBASE/VECTOR_SEARCH need a recent SDK; on the deployed runtime they work).
-#   - SQL: taggable only when NOT serverless.
-#   - DLT: in _WRITERS but its writer returns UNSUPPORTED (UI/definition-only).
-_API_TAGGABLE_PRODUCTS = ("JOBS", "ALL_PURPOSE", "MODEL_SERVING", "LAKEBASE",
-                          "VECTOR_SEARCH", "DATABASE")
+# Products with a working per-resource tag WRITER. Derived from the registry
+# (direct_tag=True), minus: DLT whose "writer" only returns UNSUPPORTED (ui_only),
+# and SQL whose taggability depends on the is_serverless flag (serverless_differs)
+# and so is handled by _taggable_predicate, not this flat list.
+_API_TAGGABLE_PRODUCTS = tuple(
+    p for p in capability.api_taggable_products()
+    if not (capability.get(p) and
+            (capability.get(p).ui_only or capability.get(p).serverless_differs))
+)
 
 
 def tagged_live_adjustment(tag_key):

@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import capability
+
 
 @dataclass
 class WriteResult:
@@ -54,15 +56,9 @@ class WriteResult:
 
 
 # Products that bill through serverless / policy attribution and cannot take a
-# per-resource custom_tags write. These are honestly reported, not attempted.
-POLICY_GOVERNED_REASON = {
-    "SQL": "Serverless SQL attributes cost via budget/tag policy, not a per-warehouse tag. "
-           "Governed by a tag policy, not a resource write.",
-    "APPS": "Databricks Apps attribute compute via budget policy; no per-app custom_tags API.",
-    "AI_GATEWAY": "AI Gateway usage has no per-resource custom_tags write API.",
-    "INTERACTIVE": "Interactive/background usage is not an individually taggable resource.",
-    "LAKEFLOW_CONNECT": "Managed ingestion attributes via policy, not a per-resource tag.",
-}
+# per-resource custom_tags write. Derived from the capability registry so there's
+# ONE source of truth (was a hand-maintained dict here that could drift).
+POLICY_GOVERNED_REASON = capability.policy_reasons()
 
 
 # --------------------------------------------------------------------------- per-product writers
