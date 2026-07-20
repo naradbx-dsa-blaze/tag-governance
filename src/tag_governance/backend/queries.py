@@ -151,13 +151,25 @@ ORDER BY cost DESC
 """, bag.params)
 
 
-def _not_already_handled(tag_key, product_col="product", workload_col="workload_id", bag=None):
-    """SQL boolean: True unless this (workload, tag_key) is ALREADY tagged or in
-    flight in the queue. The summary table's tag_keys is a daily snapshot, so
-    right after a write it still reads 'untagged' — this queries the live queue so
-    we never re-enqueue a workload already SUCCEEDED or still PENDING/RUNNING for
-    the same key. (FAILED/UNSUPPORTED rows are NOT excluded, so a fixed permission
-    can be retried.) This is the durable 'don't double-tag' guard.
+# Queue statuses that make a (workload, tag_key) NOT worth recommending again:
+#  - SUCCEEDED / PENDING / RUNNING: already tagged or in flight (never re-suggest).
+#  - UNSUPPORTED: the product has no tag-write path (Apps, serverless SQL, …) — it
+#    can NEVER succeed, so re-recommending it is pure noise.
+#  - FAILED: the last attempt failed (permission denied, resource deleted). Per
+#    user request we DON'T keep resurfacing these — a failed workload shouldn't
+#    reappear in every scan. The retry path is explicit, not automatic: the FAILED
+#    queue rows still exist, so re-running the writer on that batch retries them
+#    once the underlying permission is fixed (or use a force flag to re-recommend).
+_HANDLED_STATUSES = ("SUCCEEDED", "PENDING", "RUNNING", "UNSUPPORTED", "FAILED")
+
+
+def _not_already_handled(tag_key, product_col="product", workload_col="workload_id",
+                         bag=None, statuses=_HANDLED_STATUSES):
+    """SQL boolean: True unless this (workload, tag_key) is already handled in the
+    queue (see _HANDLED_STATUSES). The summary table's tag_keys is a daily
+    snapshot, so right after a write it still reads 'untagged' — this queries the
+    live queue so we never re-recommend a workload we've already acted on for the
+    same key. This is the durable 'don't re-recommend' guard.
 
     IMPORTANT: pass product_col/workload_col QUALIFIED with the outer table alias
     (e.g. "wl.product", "wl.workload_id"). The subquery aliases the queue as
@@ -170,12 +182,13 @@ def _not_already_handled(tag_key, product_col="product", workload_col="workload_
             f"_not_already_handled needs a qualified outer column, got {col!r} — "
             "an unqualified name binds to the inner `handled` table and breaks the guard.")
     key_sql = bag.add(tag_key, "key") if bag is not None else _sql_str(tag_key)
+    status_list = ", ".join(f"'{s}'" for s in statuses)  # fixed internal constants
     return f"""NOT EXISTS (
     SELECT 1 FROM {QUEUE_TABLE} handled
     WHERE handled.workload_id = {workload_col}
       AND handled.product = {product_col}
       AND handled.tag_key = {key_sql}
-      AND handled.status IN ('SUCCEEDED', 'PENDING', 'RUNNING')
+      AND handled.status IN ({status_list})
   )"""
 
 

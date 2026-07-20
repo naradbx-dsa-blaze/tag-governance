@@ -40,10 +40,18 @@ import ws_clients
 _MAX_RETRIES = 5
 _BASE_DELAY = 2.0  # seconds; doubled each retry
 
-# Flush status back to the queue every N completed rows so the app's 2s poll
-# shows the bar filling/draining live. Small enough to feel real-time on the
-# demo (a few dozen rows), large enough that each MERGE isn't a per-row round-trip.
-PERSIST_CHUNK = 25
+# Flush status back to the queue as rows finish so the app's 2s poll shows the
+# bar filling AND the "$ tagged live" KPI climbing in near-real-time — not a jump
+# from 0%/$0 to done when the whole job returns.
+#
+# We flush on WHICHEVER COMES FIRST: PERSIST_CHUNK rows or PERSIST_INTERVAL_S
+# seconds since the last flush. The time trigger is what makes SMALL batches
+# (a few dozen rows — the common case) update live: they'd never reach a large
+# row-count threshold, so a pure row-count chunk left them looking frozen until
+# the end. The row-count cap still bounds MERGE frequency on huge batches so we
+# don't do one round-trip per row across 50k rows.
+PERSIST_CHUNK = 10
+PERSIST_INTERVAL_S = 2.0
 
 
 def _parse_argv() -> dict:
@@ -317,14 +325,18 @@ def run():
     persist_lock = Lock()
     pending_audit: list[dict] = []
     pending_updates: list[dict] = []
+    last_flush = [time.monotonic()]  # list so the closure can mutate it
 
     def flush(force: bool = False):
         nonlocal pending_audit, pending_updates
         with persist_lock:
-            if not force and len(pending_updates) < PERSIST_CHUNK:
+            enough = len(pending_updates) >= PERSIST_CHUNK
+            due = (time.monotonic() - last_flush[0]) >= PERSIST_INTERVAL_S
+            if not force and not enough and not due:
                 return
             a, u = pending_audit, pending_updates
             pending_audit, pending_updates = [], []
+            last_flush[0] = time.monotonic()
             if a or u:
                 # _persist signature is (queue_table, audit_table, queue_updates,
                 # audit_rows, dry_run) — updates 3rd, audit 4th. Keep this order.
@@ -334,7 +346,10 @@ def run():
         with persist_lock:
             pending_audit.extend(a)
             pending_updates.extend(u)
-            ready = len(pending_updates) >= PERSIST_CHUNK
+            # Flush when we've accumulated a chunk OR enough time has elapsed since
+            # the last flush — the latter is what gives small batches live updates.
+            ready = (len(pending_updates) >= PERSIST_CHUNK
+                     or (time.monotonic() - last_flush[0]) >= PERSIST_INTERVAL_S)
         audit_rows.extend(a)
         queue_updates.extend(u)
         if ready:

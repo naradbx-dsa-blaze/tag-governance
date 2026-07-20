@@ -60,6 +60,14 @@ def test_not_already_handled_requires_qualified_columns():
     assert "wl.workload_id" in sql
 
 
+def test_not_already_handled_excludes_failed_and_unsupported():
+    # A workload that already FAILED or is UNSUPPORTED should NOT be recommended
+    # again (user ask) — both statuses must be in the guard's exclusion set.
+    sql = queries._not_already_handled("cost_center", "wl.product", "wl.workload_id")
+    for status in ("SUCCEEDED", "PENDING", "RUNNING", "FAILED", "UNSUPPORTED"):
+        assert f"'{status}'" in sql
+
+
 def test_enqueue_explicit_binds_tag_value():
     wl = [{"workload_id": "123", "product": "JOBS", "workspace_id": "w",
            "workload_name": "n", "is_serverless": False, "tag_value": NASTY, "cost": 5.0}]

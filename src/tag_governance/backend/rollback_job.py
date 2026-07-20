@@ -18,6 +18,7 @@ Parameters (job task parameters):
 from __future__ import annotations
 
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -28,9 +29,12 @@ from databricks.sdk.runtime import spark
 import writer
 import ws_clients
 
-# Flush rollback results every N rows so the app's 2s poll shows the bar
-# draining live rather than jumping at the end. See writer_job.PERSIST_CHUNK.
-PERSIST_CHUNK = 25
+# Flush rollback results as rows finish so the app's 2s poll shows the bar
+# draining live rather than jumping at the end. Flush on WHICHEVER COMES FIRST:
+# PERSIST_CHUNK rows or PERSIST_INTERVAL_S seconds — the time trigger is what
+# makes small batches (the common case) update live. See writer_job.
+PERSIST_CHUNK = 10
+PERSIST_INTERVAL_S = 2.0
 
 
 def _parse_argv() -> dict:
@@ -125,13 +129,17 @@ def run():
     # concurrent workspace threads don't hit a Delta ConcurrentAppend conflict.
     persist_lock = Lock()
     pending: list[dict] = []
+    last_flush = [time.monotonic()]  # list so the closure can mutate it
 
     def flush(force: bool = False):
         nonlocal pending
         with persist_lock:
-            if not force and len(pending) < PERSIST_CHUNK:
+            enough = len(pending) >= PERSIST_CHUNK
+            due = (time.monotonic() - last_flush[0]) >= PERSIST_INTERVAL_S
+            if not force and not enough and not due:
                 return
             batch, pending = pending, []
+            last_flush[0] = time.monotonic()
             if batch and not dry_run:
                 _persist_rollback_audit(audit_table, batch)
                 # Mark successfully-restored rows ROLLED_BACK so the UI shows the
@@ -146,7 +154,8 @@ def run():
     def collect(rows: list[dict]):
         with persist_lock:
             pending.extend(rows)
-            ready = len(pending) >= PERSIST_CHUNK
+            ready = (len(pending) >= PERSIST_CHUNK
+                     or (time.monotonic() - last_flush[0]) >= PERSIST_INTERVAL_S)
         audit_rows.extend(rows)
         if ready:
             flush()
