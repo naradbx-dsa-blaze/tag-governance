@@ -68,6 +68,16 @@ def test_not_already_handled_excludes_failed_and_unsupported():
         assert f"'{status}'" in sql
 
 
+def test_confidence_floor_is_boundary_safe():
+    # A cutoff of 0.8 must include rows stored as exactly 0.8, so the bound
+    # threshold is nudged below 0.8 (fragile driver float encodings otherwise
+    # exclude every 0.8 row → "no confident suggestions" when there are hundreds).
+    assert queries._conf_floor(0.8) < 0.8
+    # …but not so far it pulls in the next 0.1 bucket (0.7).
+    assert queries._conf_floor(0.8) > 0.7
+    assert queries._conf_floor(0.7) > 0.6
+
+
 def test_enqueue_explicit_binds_tag_value():
     wl = [{"workload_id": "123", "product": "JOBS", "workspace_id": "w",
            "workload_name": "n", "is_serverless": False, "tag_value": NASTY, "cost": 5.0}]

@@ -40,6 +40,21 @@ INVENTORY_TABLE = _table_env("TAG_GOVERNANCE_INVENTORY_TABLE")
 # tag_keys aggregated up from the daily rows of one workload
 _AGG_KEYS = "array_distinct(flatten(collect_list(tag_keys)))"
 
+# Confidence is a stored DOUBLE; suggestion confidences are quantized to 1 decimal
+# (0.2, 0.3, … 0.8). A `confidence >= min_confidence` filter at a BOUNDARY value
+# (e.g. cutoff 0.8, rows stored as exactly 0.8) is fragile across SQL-driver float
+# encodings: if the bound parameter arrives as 0.80000000001 it excludes every 0.8
+# row and the UI shows "no confident suggestions" even though there are hundreds.
+# Nudge the threshold down by half a quantization step so a cutoff of 0.8 reliably
+# INCLUDES rows stored as 0.8, independent of driver precision. 0.05 is safely
+# below the 0.1 spacing so it never pulls in the next bucket (0.7).
+_CONF_EPSILON = 0.05
+
+
+def _conf_floor(min_confidence) -> float:
+    """Boundary-safe confidence threshold: `>= _conf_floor(0.8)` matches 0.8 rows."""
+    return float(min_confidence) - _CONF_EPSILON
+
 # Capability facts (which products are policy-governed vs API-taggable) come from
 # the declarative registry in capability.py — the SINGLE source of truth shared
 # with writer.py. Previously duplicated here and could drift out of sync.
@@ -951,7 +966,7 @@ def _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces, bag):
     untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS, bag)
     where = _where(days, workspaces, bag)
     handled = _not_already_handled(tag_key, "wl.product", "wl.workload_id", bag)
-    conf = bag.add(float(min_confidence), "conf")
+    conf = bag.add(_conf_floor(min_confidence), "conf")
     return f"""
 WITH wl AS (
   SELECT product, workload_id,
@@ -1004,7 +1019,7 @@ def policy_governed_impact(tag_key, min_confidence, days, workspaces=None):
     bag = _Bag()
     untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS, bag)
     where = _where(days, workspaces, bag)
-    conf = bag.add(float(min_confidence), "conf")
+    conf = bag.add(_conf_floor(min_confidence), "conf")
     return Query(f"""
 WITH wl AS (
   SELECT product, workload_id,
