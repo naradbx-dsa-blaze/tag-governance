@@ -1,9 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import {
   useOverview, useAiPreview, useBatches, useNotTaggable, useCapabilities,
   useInventory, useRulePreview, useTagSelected, useManualTag, useRollback,
-  fieldValues,
+  useBatchDetail, fieldValues,
 } from "@/lib/api";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -642,6 +642,51 @@ function NotTaggable({ tagKey, days }: { tagKey: string; days: number }) {
   );
 }
 
+// Drill-in shown under a batch row: per-(product, reason) breakdown of WHY rows
+// didn't tag — PermissionDenied, ResourceDoesNotExist, UNSUPPORTED product, etc.
+// Answers "when stuff really doesn't get tagged, can we know why?" with the real
+// error, not just a count.
+function WhyDetail({ batchId }: { batchId: string }) {
+  const { data, isLoading } = useBatchDetail({ params: { batch_id: batchId } });
+  const rows = (data?.data.rows ?? []) as Row[];
+  if (isLoading) return <div className="py-2 text-xs text-muted-foreground">Loading reasons…</div>;
+  if (!rows.length) return <div className="py-2 text-xs text-muted-foreground">No failure detail recorded.</div>;
+  return (
+    <div className="py-1">
+      <div className="mb-1 text-xs font-semibold text-muted-foreground">Why these didn’t tag</div>
+      <Table>
+        <TableHeader><TableRow>
+          <TableHead>Product</TableHead><TableHead>Status</TableHead>
+          <TableHead className="text-right">Rows</TableHead>
+          <TableHead className="text-right">Cost</TableHead><TableHead>Reason</TableHead>
+        </TableRow></TableHeader>
+        <TableBody>
+          {rows.map((r, i) => (
+            <TableRow key={i}>
+              <TableCell className="text-sm">{String(r.product ?? "")}</TableCell>
+              <TableCell>
+                <Badge variant={String(r.status) === "FAILED" ? "destructive" : "secondary"}>
+                  {String(r.status ?? "")}
+                </Badge>
+              </TableCell>
+              <TableCell className="text-right tabular-nums">{num(r.rows)}</TableCell>
+              <TableCell className="text-right tabular-nums">{money(r.cost)}</TableCell>
+              <TableCell className="text-xs" title={String(r.sample_reason ?? "")}>
+                {String(r.reason ?? r.sample_reason ?? "unknown")}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+      <div className="mt-1 text-xs text-muted-foreground">
+        FAILED = usually a permission or deleted-resource issue (the writer identity
+        can’t manage that resource); “can’t tag” = the product is attributed a
+        different way (budget policy / pipeline definition). Hover a reason for the full message.
+      </div>
+    </div>
+  );
+}
+
 // ---------- Batches + live progress + rollback ----------
 function Batches() {
   // Poll fast (2s) while any job is in flight so tagging fills / rollback drains live.
@@ -649,6 +694,7 @@ function Batches() {
   const rollback = useRollback();
   const [links, setLinks] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<Record<string, string>>({}); // batch_id -> status text
+  const [why, setWhy] = useState<Record<string, boolean>>({}); // batch_id -> show failure reasons
   const batches = (data?.data.batches ?? []) as Row[];
 
   const doRollback = async (id: string) => {
@@ -707,8 +753,11 @@ function Batches() {
               if (running) parts.push(`${running} running…`);
               // Honest note when a rollback couldn't fully revert.
               const residual = rolledBack > 0 && tagged > 0 && !inFlight;
+              // How many rows didn't get tagged (so we can offer a "Why?" drill-in).
+              const notTagged = num(b.failed) + num(b.unsupported);
               return (
-                <TableRow key={id}>
+                <Fragment key={id}>
+                <TableRow>
                   <TableCell><Badge variant="secondary">{id}</Badge></TableCell>
                   <TableCell className="text-right tabular-nums">{money(b.cost)}</TableCell>
                   <TableCell>
@@ -725,7 +774,16 @@ function Batches() {
                       </span>
                     )}
                   </TableCell>
-                  <TableCell className="text-sm">{parts.join(" · ") || "—"}</TableCell>
+                  <TableCell className="text-sm">
+                    {parts.join(" · ") || "—"}
+                    {notTagged > 0 && (
+                      <button
+                        className="ml-2 text-xs underline text-muted-foreground hover:text-foreground"
+                        onClick={() => setWhy((w) => ({ ...w, [id]: !w[id] }))}>
+                        {why[id] ? "hide why" : `why? (${notTagged})`}
+                      </button>
+                    )}
+                  </TableCell>
                   <TableCell className="whitespace-nowrap">
                     {tagged > 0 && (
                       <Button variant="secondary" size="sm" disabled={!!busy[id]}
@@ -736,6 +794,14 @@ function Batches() {
                     )}
                   </TableCell>
                 </TableRow>
+                {why[id] && (
+                  <TableRow>
+                    <TableCell colSpan={5} className="bg-muted/30">
+                      <WhyDetail batchId={id} />
+                    </TableCell>
+                  </TableRow>
+                )}
+                </Fragment>
               );
             })}
           </TableBody>

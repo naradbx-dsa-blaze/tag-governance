@@ -152,7 +152,18 @@ def _not_already_handled(tag_key, product_col="product", workload_col="workload_
     right after a write it still reads 'untagged' — this queries the live queue so
     we never re-enqueue a workload already SUCCEEDED or still PENDING/RUNNING for
     the same key. (FAILED/UNSUPPORTED rows are NOT excluded, so a fixed permission
-    can be retried.) This is the durable 'don't double-tag' guard."""
+    can be retried.) This is the durable 'don't double-tag' guard.
+
+    IMPORTANT: pass product_col/workload_col QUALIFIED with the outer table alias
+    (e.g. "wl.product", "wl.workload_id"). The subquery aliases the queue as
+    `handled`, so a BARE "product"/"workload_id" would bind to the INNER table
+    (self-reference), making the predicate match on any non-empty queue and
+    silently exclude every row. We assert qualification to fail loudly instead.
+    """
+    for col in (product_col, workload_col):
+        assert "." in col, (
+            f"_not_already_handled needs a qualified outer column, got {col!r} — "
+            "an unqualified name binds to the inner `handled` table and breaks the guard.")
     return f"""NOT EXISTS (
     SELECT 1 FROM {QUEUE_TABLE} handled
     WHERE handled.workload_id = {workload_col}
@@ -346,6 +357,7 @@ def bulk_rule_impact(days, tag_keys, rules, workspaces=None):
     # per-rule first-match coverage via a CASE priority ladder
     ladder = "\n".join(
         f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id")
     return f"""
 WITH wl AS (
   SELECT workload_id,
@@ -359,7 +371,9 @@ WITH wl AS (
   WHERE {_where(days, workspaces)}
   GROUP BY product, workload_id
 ),
-untagged AS (SELECT * FROM wl WHERE is_untagged AND cost > 0),
+-- Exclude workloads already tagged/in-flight for this key in the live queue: the
+-- summary snapshot lags a write by up to a day, so filter on the queue too.
+untagged AS (SELECT * FROM wl WHERE is_untagged AND cost > 0 AND {handled}),
 matched AS (
   SELECT *,
          CASE
@@ -384,6 +398,7 @@ def bulk_rule_per_rule(days, tag_keys, rules, workspaces=None):
         return None
     ladder = "\n".join(
         f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id")
     return f"""
 WITH wl AS (
   SELECT workload_id, product,
@@ -398,7 +413,7 @@ matched AS (
   SELECT cost, CASE
 {ladder}
            ELSE -1 END AS first_rule
-  FROM wl WHERE is_untagged AND cost > 0
+  FROM wl WHERE is_untagged AND cost > 0 AND {handled}
 )
 SELECT first_rule, COUNT(*) AS workloads, ROUND(SUM(cost),0) AS cost
 FROM matched WHERE first_rule >= 0
@@ -423,6 +438,7 @@ def bulk_rule_sample(days, tag_keys, rules, workspaces=None, limit=200):
     val_ladder = "\n".join(
         f"      WHEN {i} THEN {_sql_str(r['tags'].get(key, ''))}"
         for i, r in enumerate(valid))
+    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id")
     return f"""
 WITH wl AS (
   SELECT workload_id, product,
@@ -443,6 +459,8 @@ matched AS (
   FROM wl
   WHERE is_untagged AND cost > 0 AND ({any_match})
     AND {_taggable_predicate('product', 'is_serverless')}
+    -- Don't surface workloads already tagged/in-flight for this key (queue lags snapshot).
+    AND {handled}
 )
 SELECT workload_id, product, workspace_id, workload_name, owner,
        is_serverless, cost,
@@ -717,19 +735,31 @@ LIMIT {limit}
 
 
 def batch_failure_breakdown(batch_id, limit=50):
-    """Per (product, status) rollup with a sample reason — so the batch view can
-    show WHY rows didn't tag (e.g. PermissionDenied on jobs you don't own),
-    instead of a bare 'FAILED' count that reads like success."""
+    """Per (product, status, reason) rollup — so the batch view can show WHY rows
+    didn't tag (e.g. PermissionDenied on jobs you don't own, ResourceDoesNotExist
+    for deleted resources, UNSUPPORTED product limits), instead of a bare 'FAILED'
+    count that reads like success.
+
+    Groups by a NORMALIZED reason (the error class / leading phrase, not the full
+    message which embeds a unique resource id) so several different failure causes
+    within one product each get their own row + count, rather than collapsing to a
+    single MIN() sample that hides the rest."""
+    # Normalize: take the text up to the first ':' (the exception class / phrase),
+    # so "PermissionDenied: job 123 ..." and "PermissionDenied: job 456 ..." group
+    # together, while a genuinely different cause stays separate. Full example kept
+    # as sample_reason for the tooltip/first-row detail.
+    reason_norm = "COALESCE(NULLIF(TRIM(SPLIT(last_error, ':')[0]), ''), 'unknown')"
     return f"""
 SELECT product,
        status,
+       {reason_norm}            AS reason,
        COUNT(*)                 AS rows,
        ROUND(SUM(list_cost), 0) AS cost,
        MIN(last_error)          AS sample_reason
 FROM {QUEUE_TABLE}
 WHERE batch_id = {_sql_str(batch_id)}
   AND status IN ('FAILED', 'UNSUPPORTED')
-GROUP BY product, status
+GROUP BY product, status, {reason_norm}
 ORDER BY rows DESC
 LIMIT {limit}
 """
