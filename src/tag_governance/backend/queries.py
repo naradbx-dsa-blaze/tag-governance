@@ -17,6 +17,8 @@ Args:
 
 import os
 
+from db import Query
+
 
 def _table_env(var: str) -> str:
     """Resolve a fully-qualified table name from env. The bundle always sets these
@@ -80,17 +82,18 @@ def tagged_live_adjustment(tag_key):
     we subtract that from the snapshot's untagged total to make the number move
     within seconds of a writer run. DISTINCT workload so re-tags don't double-count.
     """
-    return f"""
+    bag = _Bag()
+    return Query(f"""
 SELECT
   COUNT(DISTINCT workload_id)                         AS workloads,
   ROUND(SUM(list_cost), 0)                            AS cost
 FROM (
   SELECT workload_id, MAX(list_cost) AS list_cost
   FROM {QUEUE_TABLE}
-  WHERE status = 'SUCCEEDED' AND tag_key = {_sql_str(tag_key)}
+  WHERE status = 'SUCCEEDED' AND tag_key = {bag.add(tag_key,'key')}
   GROUP BY workload_id
 )
-"""
+""", bag.params)
 
 
 def not_taggable_breakdown(tag_key, days, workspaces=None):
@@ -109,16 +112,18 @@ def not_taggable_breakdown(tag_key, days, workspaces=None):
       - NO_API (Agent Bricks, Supervisor Agent, AI Functions, …): no documented tag
         path today — verify in the resource UI / current docs.
     Everything the writer CAN tag per-resource via API is excluded (normal flow)."""
-    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS)
+    bag = _Bag()
+    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
     plist = ", ".join(f"'{p}'" for p in _POLICY_GOVERNED_PRODUCTS)
     taggable = ", ".join(f"'{p}'" for p in _API_TAGGABLE_PRODUCTS)
-    return f"""
+    return Query(f"""
 WITH wl AS (
   SELECT product, workload_id,
          MAX(is_serverless) AS is_serverless,
          SUM(list_cost)     AS cost
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
   HAVING {untag_expr} AND SUM(list_cost) > 0
 ),
@@ -143,10 +148,10 @@ FROM classified
 WHERE reason <> 'TAGGABLE'
 GROUP BY product, reason
 ORDER BY cost DESC
-"""
+""", bag.params)
 
 
-def _not_already_handled(tag_key, product_col="product", workload_col="workload_id"):
+def _not_already_handled(tag_key, product_col="product", workload_col="workload_id", bag=None):
     """SQL boolean: True unless this (workload, tag_key) is ALREADY tagged or in
     flight in the queue. The summary table's tag_keys is a daily snapshot, so
     right after a write it still reads 'untagged' — this queries the live queue so
@@ -164,30 +169,44 @@ def _not_already_handled(tag_key, product_col="product", workload_col="workload_
         assert "." in col, (
             f"_not_already_handled needs a qualified outer column, got {col!r} — "
             "an unqualified name binds to the inner `handled` table and breaks the guard.")
+    key_sql = bag.add(tag_key, "key") if bag is not None else _sql_str(tag_key)
     return f"""NOT EXISTS (
     SELECT 1 FROM {QUEUE_TABLE} handled
     WHERE handled.workload_id = {workload_col}
       AND handled.product = {product_col}
-      AND handled.tag_key = {_sql_str(tag_key)}
+      AND handled.tag_key = {key_sql}
       AND handled.status IN ('SUCCEEDED', 'PENDING', 'RUNNING')
   )"""
 
 
-def _missing_keys_predicate(tag_keys, col="tag_keys"):
+def _missing_keys_predicate(tag_keys, col="tag_keys", bag=None):
     """True when the workload is missing ALL chosen keys.
 
-    Keys are user-chosen (sidebar), so escape single quotes to avoid a broken
-    literal / injection on a key name like O'Brien-cost.
+    Keys are user-chosen (sidebar). With a `bag`, each key is a bound parameter
+    (no escaping needed); without one, we fall back to escaped literals for the
+    static callers not yet migrated.
     """
     if not tag_keys:
         return f"size({col}) = 0"
+    if bag is not None:
+        markers = ", ".join(bag.add_all(tag_keys, "key"))
+        return f"NOT arrays_overlap({col}, array({markers}))"
     arr = ", ".join("'" + str(k).replace("'", "''") + "'" for k in tag_keys)
     return f"NOT arrays_overlap({col}, array({arr}))"
 
 
-def _where(days, workspaces):
-    """Shared WHERE clause: date window + optional workspace filter."""
-    clause = f"usage_date >= current_date() - INTERVAL {days} DAYS"
+def _where(days, workspaces, bag=None):
+    """Shared WHERE clause: date window + optional workspace filter.
+
+    With a `bag`, days and workspace ids are bound parameters; otherwise literal
+    (days is always a validated int; workspace ids come from the summary table)."""
+    if bag is not None:
+        clause = f"usage_date >= current_date() - INTERVAL {bag.add(int(days), 'days')} DAYS"
+        if workspaces:
+            ids = ", ".join(bag.add_all(workspaces, "ws"))
+            clause += f"\n    AND workspace_id IN ({ids})"
+        return clause
+    clause = f"usage_date >= current_date() - INTERVAL {int(days)} DAYS"
     if workspaces:
         ids = ", ".join(f"'{w}'" for w in workspaces)
         clause += f"\n    AND workspace_id IN ({ids})"
@@ -195,13 +214,16 @@ def _where(days, workspaces):
 
 
 def kpi_summary(days, tag_keys, workspaces=None):
-    return f"""
+    bag = _Bag()
+    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    return Query(f"""
 WITH workload AS (
   SELECT product, workload_id,
          SUM(list_cost) AS cost,
-         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged
+         {untag} AS is_untagged
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
 )
 SELECT
@@ -210,17 +232,20 @@ SELECT
   ROUND(100.0 * SUM(CASE WHEN is_untagged THEN cost ELSE 0 END) / NULLIF(SUM(cost), 0), 1) AS pct_untagged,
   COUNT(DISTINCT CASE WHEN is_untagged THEN workload_id END)       AS untagged_workloads
 FROM workload
-"""
+""", bag.params)
 
 
 def by_product(days, tag_keys, workspaces=None):
-    return f"""
+    bag = _Bag()
+    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    return Query(f"""
 WITH workload AS (
   SELECT product, workload_id,
          SUM(list_cost) AS cost,
-         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged
+         {untag} AS is_untagged
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
 )
 SELECT product,
@@ -232,18 +257,21 @@ FROM workload
 GROUP BY product
 HAVING total_cost > 0
 ORDER BY untagged_cost DESC
-"""
+""", bag.params)
 
 
 def by_workspace(days, tag_keys, workspaces=None):
     """Untagged spend per workspace — the multi-workspace view."""
-    return f"""
+    bag = _Bag()
+    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    return Query(f"""
 WITH workload AS (
   SELECT workspace_id, workload_id,
          SUM(list_cost) AS cost,
-         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged
+         {untag} AS is_untagged
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY workspace_id, workload_id
 ),
 agg AS (
@@ -261,12 +289,14 @@ FROM agg a
 LEFT JOIN system.access.workspaces_latest ws ON a.workspace_id = ws.workspace_id
 WHERE a.total_cost > 0
 ORDER BY a.untagged_cost DESC
-"""
+""", bag.params)
 
 
 def leaderboard(days, tag_keys, workspaces=None, limit=200):
-    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS)
-    return f"""
+    bag = _Bag()
+    where = _where(days, workspaces, bag)
+    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    return Query(f"""
 SELECT product,
        workload_id,
        MAX(workspace_id)                           AS workspace_id,
@@ -275,12 +305,12 @@ SELECT product,
        MAX(is_serverless)                          AS is_serverless,
        ROUND(SUM(list_cost), 0)                    AS untagged_cost
 FROM {SUMMARY_TABLE}
-WHERE {_where(days, workspaces)}
+WHERE {where}
 GROUP BY product, workload_id
 HAVING {untag_expr} AND SUM(list_cost) > 0
 ORDER BY untagged_cost DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 def untagged_workloads(days, tag_keys, workspaces=None, limit=10000):
@@ -289,8 +319,10 @@ def untagged_workloads(days, tag_keys, workspaces=None, limit=10000):
     Returns one row per workload with owner / workspace / product / name / cost,
     so rule matching + conflict detection can run client-side over the full set.
     """
-    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS)
-    return f"""
+    bag = _Bag()
+    where = _where(days, workspaces, bag)
+    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    return Query(f"""
 SELECT product,
        workload_id,
        MAX(workspace_id)                AS workspace_id,
@@ -299,35 +331,48 @@ SELECT product,
        MAX(is_serverless)               AS is_serverless,
        ROUND(SUM(list_cost), 0)         AS untagged_cost
 FROM {SUMMARY_TABLE}
-WHERE {_where(days, workspaces)}
+WHERE {where}
 GROUP BY product, workload_id
 HAVING {untag_expr} AND SUM(list_cost) > 0
 ORDER BY untagged_cost DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
-def _rule_sql_predicate(rule):
+def _rule_sql_predicate(rule, bag=None):
     """SQL boolean for one rule's match condition over the workload aggregate.
 
-    Drives the ENQUEUE path (enqueue_bulk_sql), so over-matching here means the
-    writer job tags MORE resources than intended — escaping must be exact:
-      - single quotes doubled (SQL literal safety)
-      - LIKE metacharacters %/_/\\ escaped, with an explicit ESCAPE '\\' clause,
-        so a user value like "data_eng" or "50%" matches literally, not as a glob.
-    For the `matches` (glob) op we escape literal %/_/\\ FIRST, then translate the
-    glob wildcards *→% and ?→_ so they stay active.
+    Drives the ENQUEUE path, so over-matching here would tag MORE resources than
+    intended. The `field` picks a column from a FIXED whitelist (never free text,
+    so it can't be a parameter and doesn't need to be). The user `value`:
+      - With a `bag`: bound as a parameter — no quote escaping needed. LIKE
+        metacharacters (%/_/\\) in the value are still escaped INTO the parameter
+        string (with ESCAPE '\\') so "data_eng"/"50%" match literally, not as
+        globs. For `matches`, literal metachars are escaped first, then glob
+        wildcards *→% and ?→_ are applied so they stay active.
+      - Without a bag (legacy literal path): same logic via escaped SQL literals.
     """
     col = {"owner": "owner", "workspace": "workspace_id",
            "product": "product", "name": "workload_name"}[rule["field"]]
-    val = rule["value"].replace("'", "''")
     c = f"lower(coalesce({col},''))"
-    if rule["op"] == "equals":
+    op = rule["op"]
+    raw = rule["value"]
+    if bag is not None:
+        if op == "equals":
+            return f"{c} = lower({bag.add(raw, 'rule')})"
+        if op == "contains":
+            return f"{c} LIKE lower({bag.add('%' + _escape_like(raw) + '%', 'rule')}) ESCAPE '\\\\'"
+        if op == "matches":
+            pat = _escape_like(raw).replace("*", "%").replace("?", "_")
+            return f"{c} LIKE lower({bag.add(pat, 'rule')}) ESCAPE '\\\\'"
+        return "false"
+    # legacy literal path (kept for any un-migrated caller)
+    val = raw.replace("'", "''")
+    if op == "equals":
         return f"{c} = lower('{val}')"
-    if rule["op"] == "contains":
-        lit = _escape_like(val)
-        return f"{c} LIKE lower('%{lit}%') ESCAPE '\\\\'"
-    if rule["op"] == "matches":  # glob -> LIKE
+    if op == "contains":
+        return f"{c} LIKE lower('%{_escape_like(val)}%') ESCAPE '\\\\'"
+    if op == "matches":
         like = _escape_like(val).replace("*", "%").replace("?", "_")
         return f"{c} LIKE lower('{like}') ESCAPE '\\\\'"
     return "false"
@@ -353,22 +398,25 @@ def bulk_rule_impact(days, tag_keys, rules, workspaces=None):
     valid = [r for r in rules if r.get("value") and r.get("tags")]
     if not valid:
         return None
-    any_match = " OR ".join(f"({_rule_sql_predicate(r)})" for r in valid)
+    bag = _Bag()
+    preds = [_rule_sql_predicate(r, bag) for r in valid]  # once per rule (reused below)
+    any_match = " OR ".join(f"({p})" for p in preds)
     # per-rule first-match coverage via a CASE priority ladder
-    ladder = "\n".join(
-        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
-    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id")
-    return f"""
+    ladder = "\n".join(f"      WHEN {p} THEN {i}" for i, p in enumerate(preds))
+    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id", bag)
+    return Query(f"""
 WITH wl AS (
   SELECT workload_id,
          MAX(workspace_id)  AS workspace_id,
          MAX(workload_name) AS workload_name,
          MAX(owner)         AS owner,
          product,
-         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         {untag} AS is_untagged,
          SUM(list_cost)     AS cost
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
 ),
 -- Exclude workloads already tagged/in-flight for this key in the live queue: the
@@ -388,7 +436,7 @@ SELECT
   COUNT(*)                                           AS matched_count,
   ROUND(SUM(cost),0)                                 AS matched_cost
 FROM matched
-"""
+""", bag.params)
 
 
 def bulk_rule_per_rule(days, tag_keys, rules, workspaces=None):
@@ -396,17 +444,20 @@ def bulk_rule_per_rule(days, tag_keys, rules, workspaces=None):
     valid = [r for r in rules if r.get("value") and r.get("tags")]
     if not valid:
         return None
-    ladder = "\n".join(
-        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
-    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id")
-    return f"""
+    bag = _Bag()
+    preds = [_rule_sql_predicate(r, bag) for r in valid]
+    ladder = "\n".join(f"      WHEN {p} THEN {i}" for i, p in enumerate(preds))
+    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id", bag)
+    return Query(f"""
 WITH wl AS (
   SELECT workload_id, product,
-         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         {untag} AS is_untagged,
          SUM(list_cost) AS cost,
          MAX(owner) AS owner, MAX(workspace_id) AS workspace_id, MAX(workload_name) AS workload_name
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
 ),
 matched AS (
@@ -418,7 +469,7 @@ matched AS (
 SELECT first_rule, COUNT(*) AS workloads, ROUND(SUM(cost),0) AS cost
 FROM matched WHERE first_rule >= 0
 GROUP BY first_rule ORDER BY first_rule
-"""
+""", bag.params)
 
 
 def bulk_rule_sample(days, tag_keys, rules, workspaces=None, limit=200):
@@ -430,24 +481,27 @@ def bulk_rule_sample(days, tag_keys, rules, workspaces=None, limit=200):
     valid = [r for r in rules if r.get("value") and r.get("tags")]
     if not valid:
         return None
-    any_match = " OR ".join(f"({_rule_sql_predicate(r)})" for r in valid)
-    ladder = "\n".join(
-        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    bag = _Bag()
+    preds = [_rule_sql_predicate(r, bag) for r in valid]
+    any_match = " OR ".join(f"({p})" for p in preds)
+    ladder = "\n".join(f"      WHEN {p} THEN {i}" for i, p in enumerate(preds))
     # map first_rule index -> the tag value it assigns for `tag_keys[0]`
     key = tag_keys[0]
     val_ladder = "\n".join(
-        f"      WHEN {i} THEN {_sql_str(r['tags'].get(key, ''))}"
+        f"      WHEN {i} THEN {bag.add(r['tags'].get(key, ''), 'val')}"
         for i, r in enumerate(valid))
-    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id")
-    return f"""
+    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id", bag)
+    return Query(f"""
 WITH wl AS (
   SELECT workload_id, product,
          MAX(workspace_id) AS workspace_id, MAX(workload_name) AS workload_name, MAX(owner) AS owner,
          MAX(is_serverless) AS is_serverless,
-         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         {untag} AS is_untagged,
          SUM(list_cost) AS cost
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
 ),
 matched AS (
@@ -470,8 +524,8 @@ SELECT workload_id, product, workspace_id, workload_name, owner,
 FROM matched
 WHERE first_rule >= 0
 ORDER BY cost DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 def workspace_options(days):
@@ -480,7 +534,7 @@ def workspace_options(days):
 WITH s AS (
   SELECT workspace_id, ROUND(SUM(list_cost), 0) AS cost
   FROM {SUMMARY_TABLE}
-  WHERE usage_date >= current_date() - INTERVAL {days} DAYS
+  WHERE usage_date >= current_date() - INTERVAL {int(days)} DAYS
   GROUP BY workspace_id
 )
 SELECT s.workspace_id,
@@ -494,17 +548,19 @@ ORDER BY s.cost DESC
 
 def distinct_tag_keys(days, workspaces=None):
     """All tag keys currently in use — to seed the picker."""
-    return f"""
+    bag = _Bag()
+    where = _where(days, workspaces, bag)
+    return Query(f"""
 SELECT tag_key, COUNT(DISTINCT workload_id) AS workloads
 FROM (
   SELECT workload_id, explode(tag_keys) AS tag_key
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
 )
 GROUP BY tag_key
 ORDER BY workloads DESC
 LIMIT 50
-"""
+""", bag.params)
 
 
 def distinct_field_values(field, days, workspaces=None, limit=2000):
@@ -515,15 +571,17 @@ def distinct_field_values(field, days, workspaces=None, limit=2000):
     owners late in the alphabet."""
     col = {"owner": "owner", "product": "product",
            "workspace": "workspace_id", "name": "workload_name"}.get(field, "owner")
-    return f"""
+    bag = _Bag()
+    where = _where(days, workspaces, bag)
+    return Query(f"""
 SELECT {col} AS value, ROUND(SUM(list_cost), 0) AS cost,
        COUNT(DISTINCT workload_id) AS workloads
 FROM {SUMMARY_TABLE}
-WHERE {_where(days, workspaces)} AND {col} IS NOT NULL AND {col} <> ''
+WHERE {where} AND {col} IS NOT NULL AND {col} <> ''
 GROUP BY {col}
 ORDER BY lower({col}) ASC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 def freshness():
@@ -544,10 +602,45 @@ def _sql_str(v):
     escapes backslashes — Databricks/Spark honors C-style backslash escapes in
     string literals, so a lone trailing backslash could otherwise escape the
     closing quote. Also strips NUL/newlines. Belt-and-suspenders with the API-side
-    charset validation in app._validate_tag."""
+    charset validation in app._validate_tag.
+
+    NOTE: prefer bound parameters (_Bag) for any NEW user-input query — this
+    literal path remains for the static queries not yet migrated. See db.Query.
+    """
     s = str(v).replace("\\", "\\\\").replace("'", "''")
     s = s.replace("\x00", "").replace("\n", " ").replace("\r", " ")
     return "'" + s + "'"
+
+
+class _Bag:
+    """Collects NAMED bind parameters for one query and hands back their markers.
+
+    The injection-safe alternative to _sql_str f-string interpolation: user values
+    (tag keys/values, rule match text, workspace ids, day windows) are registered
+    here and referenced in the SQL only as ':name' markers — the driver sends them
+    as typed server-side parameters, so nothing the user typed is ever parsed as
+    SQL. Column NAMES still can't be parameters (they're structural), but those are
+    always chosen from fixed whitelists, never free text.
+
+    Usage:
+        bag = _Bag()
+        sql = f"WHERE tag_key = {bag.add(tag_key)}"
+        return Query(sql, bag.params)
+    """
+    def __init__(self):
+        self.params: dict = {}
+        self._n = 0
+
+    def add(self, value, prefix="p") -> str:
+        """Register one value; return its ':marker'."""
+        name = f"{prefix}_{self._n}"
+        self._n += 1
+        self.params[name] = value
+        return f":{name}"
+
+    def add_all(self, values, prefix="p") -> list[str]:
+        """Register a list of values; return a list of ':marker's."""
+        return [self.add(v, prefix) for v in values]
 
 
 def enqueue_bulk_sql(batch_id, requested_by, days, tag_keys, rules, workspaces=None):
@@ -562,18 +655,22 @@ def enqueue_bulk_sql(batch_id, requested_by, days, tag_keys, rules, workspaces=N
     if not valid:
         return None
 
-    ladder = "\n".join(
-        f"      WHEN {_rule_sql_predicate(r)} THEN {i}" for i, r in enumerate(valid))
+    bag = _Bag()
+    preds = [_rule_sql_predicate(r, bag) for r in valid]
+    ladder = "\n".join(f"      WHEN {p} THEN {i}" for i, p in enumerate(preds))
 
     # Map each rule index -> its tags, expanded into (rule_idx, key, value) rows
-    # so a LATERAL join attaches the winning rule's tags to each workload.
+    # so a join attaches the winning rule's tags to each workload. Keys/values are
+    # bound parameters (user-supplied), not interpolated literals.
     tag_tuples = []
     for i, r in enumerate(valid):
         for k, v in r["tags"].items():
-            tag_tuples.append(f"({i}, {_sql_str(k)}, {_sql_str(v)})")
+            tag_tuples.append(f"({i}, {bag.add(k, 'tk')}, {bag.add(v, 'tv')})")
     tags_values = ",\n    ".join(tag_tuples)
 
-    return f"""
+    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    return Query(f"""
 INSERT INTO {QUEUE_TABLE}
   (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
    workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
@@ -583,10 +680,10 @@ WITH wl AS (
          MAX(workload_name) AS workload_name,
          MAX(owner)         AS owner,
          MAX(is_serverless) AS is_serverless,
-         {_missing_keys_predicate(tag_keys, _AGG_KEYS)} AS is_untagged,
+         {untag} AS is_untagged,
          SUM(list_cost)     AS cost
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
 ),
 matched AS (
@@ -605,9 +702,9 @@ ruletags(rule_idx, tag_key, tag_value) AS (
     {tags_values}
 )
 SELECT
-  {_sql_str(batch_id)}      AS batch_id,
-  current_timestamp()       AS enqueued_at,
-  {_sql_str(requested_by)}  AS requested_by,
+  {bag.add(batch_id, 'batch')}      AS batch_id,
+  current_timestamp()               AS enqueued_at,
+  {bag.add(requested_by, 'by')}     AS requested_by,
   m.workspace_id, m.product, m.workload_id, m.workload_name, m.is_serverless,
   rt.tag_key, rt.tag_value,
   m.cost                    AS list_cost,
@@ -616,7 +713,7 @@ SELECT
 FROM matched m
 JOIN ruletags rt ON rt.rule_idx = m.first_rule
 WHERE m.first_rule >= 0
-"""
+""", bag.params)
 
 
 def enqueue_single_sql(batch_id, requested_by, workspace_id, product, workload_id,
@@ -626,22 +723,23 @@ def enqueue_single_sql(batch_id, requested_by, workspace_id, product, workload_i
     list_cost is carried so single-enqueued rows drain cost-descending like bulk
     rows and show their real cost in the Batches tab (NULL → drained last, $0).
     """
+    bag = _Bag()
     cost_sql = "NULL" if list_cost is None else f"CAST({float(list_cost)} AS DECIMAL(38,6))"
     rows = []
     for k, v in tags.items():
         rows.append(
-            f"({_sql_str(batch_id)}, current_timestamp(), {_sql_str(requested_by)}, "
-            f"{_sql_str(workspace_id)}, {_sql_str(product)}, {_sql_str(workload_id)}, "
-            f"{_sql_str(workload_name or workload_id)}, {1 if is_serverless else 0}, "
-            f"{_sql_str(k)}, {_sql_str(v)}, {cost_sql}, 'PENDING', 0)")
+            f"({bag.add(batch_id,'b')}, current_timestamp(), {bag.add(requested_by,'by')}, "
+            f"{bag.add(workspace_id,'ws')}, {bag.add(product,'pr')}, {bag.add(workload_id,'wid')}, "
+            f"{bag.add(workload_name or workload_id,'wn')}, {1 if is_serverless else 0}, "
+            f"{bag.add(k,'tk')}, {bag.add(v,'tv')}, {cost_sql}, 'PENDING', 0)")
     values = ",\n  ".join(rows)
-    return f"""
+    return Query(f"""
 INSERT INTO {QUEUE_TABLE}
   (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
    workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
 VALUES
   {values}
-"""
+""", bag.params)
 
 
 def enqueue_explicit_sql(batch_id, requested_by, tag_key, workloads):
@@ -654,6 +752,7 @@ def enqueue_explicit_sql(batch_id, requested_by, tag_key, workloads):
       {workload_id, product, workspace_id, workload_name, is_serverless, tag_value, cost}
     Returns None if the list is empty.
     """
+    bag = _Bag()
     rows = []
     for w in workloads:
         if not w.get("workload_id") or not w.get("tag_value"):
@@ -661,54 +760,58 @@ def enqueue_explicit_sql(batch_id, requested_by, tag_key, workloads):
         cost = w.get("cost")
         cost_sql = "NULL" if cost in (None, "") else f"CAST({float(cost)} AS DECIMAL(38,6))"
         rows.append(
-            f"({_sql_str(batch_id)}, current_timestamp(), {_sql_str(requested_by)}, "
-            f"{_sql_str(str(w.get('workspace_id') or ''))}, {_sql_str(w['product'])}, "
-            f"{_sql_str(str(w['workload_id']))}, "
-            f"{_sql_str(w.get('workload_name') or str(w['workload_id']))}, "
+            f"({bag.add(batch_id,'b')}, current_timestamp(), {bag.add(requested_by,'by')}, "
+            f"{bag.add(str(w.get('workspace_id') or ''),'ws')}, {bag.add(w['product'],'pr')}, "
+            f"{bag.add(str(w['workload_id']),'wid')}, "
+            f"{bag.add(w.get('workload_name') or str(w['workload_id']),'wn')}, "
             f"{1 if w.get('is_serverless') else 0}, "
-            f"{_sql_str(tag_key)}, {_sql_str(w['tag_value'])}, {cost_sql}, 'PENDING', 0)")
+            f"{bag.add(tag_key,'tk')}, {bag.add(w['tag_value'],'tv')}, {cost_sql}, 'PENDING', 0)")
     if not rows:
         return None
     values = ",\n  ".join(rows)
-    return f"""
+    return Query(f"""
 INSERT INTO {QUEUE_TABLE}
   (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
    workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
 VALUES
   {values}
-"""
+""", bag.params)
 
 
 def count_queue_rows(batch_id):
     """Ground-truth row count for a batch — the app counts rows this way instead
     of trusting DML rowcount (the SQL connector reports -1 for INSERTs)."""
-    return f"SELECT COUNT(*) AS n FROM {QUEUE_TABLE} WHERE batch_id = {_sql_str(batch_id)}"
+    bag = _Bag()
+    return Query(f"SELECT COUNT(*) AS n FROM {QUEUE_TABLE} WHERE batch_id = {bag.add(batch_id,'b')}",
+                 bag.params)
 
 
 def batch_status(batch_id):
     """Per-status counts + cost for one batch — headline for the Batches tab."""
-    return f"""
+    bag = _Bag()
+    return Query(f"""
 SELECT status,
        COUNT(*)                          AS rows,
        COUNT(DISTINCT workload_id)       AS workloads,
        ROUND(SUM(list_cost), 0)          AS cost
 FROM {QUEUE_TABLE}
-WHERE batch_id = {_sql_str(batch_id)}
+WHERE batch_id = {bag.add(batch_id,'b')}
 GROUP BY status
 ORDER BY status
-"""
+""", bag.params)
 
 
 def batch_rows(batch_id, limit=500):
     """Per-workload rows for a batch, with status + any error (for the detail table)."""
-    return f"""
+    bag = _Bag()
+    return Query(f"""
 SELECT product, workload_id, workload_name, tag_key, tag_value,
        status, last_error, ROUND(list_cost, 0) AS cost
 FROM {QUEUE_TABLE}
-WHERE batch_id = {_sql_str(batch_id)}
+WHERE batch_id = {bag.add(batch_id,'b')}
 ORDER BY list_cost DESC NULLS LAST
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 def recent_batches(limit=25):
@@ -749,7 +852,8 @@ def batch_failure_breakdown(batch_id, limit=50):
     # together, while a genuinely different cause stays separate. Full example kept
     # as sample_reason for the tooltip/first-row detail.
     reason_norm = "COALESCE(NULLIF(TRIM(SPLIT(last_error, ':')[0]), ''), 'unknown')"
-    return f"""
+    bag = _Bag()
+    return Query(f"""
 SELECT product,
        status,
        {reason_norm}            AS reason,
@@ -757,24 +861,25 @@ SELECT product,
        ROUND(SUM(list_cost), 0) AS cost,
        MIN(last_error)          AS sample_reason
 FROM {QUEUE_TABLE}
-WHERE batch_id = {_sql_str(batch_id)}
+WHERE batch_id = {bag.add(batch_id,'b')}
   AND status IN ('FAILED', 'UNSUPPORTED')
 GROUP BY product, status, {reason_norm}
 ORDER BY rows DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 def audit_for_batch(batch_id, limit=500):
     """Audit history for a batch — the old→new record, for verify + rollback view."""
-    return f"""
+    bag = _Bag()
+    return Query(f"""
 SELECT executed_at, action, product, workload_id, tag_key,
        old_value, new_value, status, error
 FROM {AUDIT_TABLE}
-WHERE batch_id = {_sql_str(batch_id)}
+WHERE batch_id = {bag.add(batch_id,'b')}
 ORDER BY executed_at DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 # ============================================================================
@@ -787,8 +892,10 @@ def suggestions_join(days, tag_keys, workspaces=None, limit=200):
     LEFT JOINs the suggestions table so workloads without a suggestion still show.
     The suggestion is a HINT only — the human decides whether to act on it.
     """
-    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS)
-    return f"""
+    bag = _Bag()
+    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    return Query(f"""
 WITH wl AS (
   SELECT product, workload_id,
          MAX(workspace_id)               AS workspace_id,
@@ -797,7 +904,7 @@ WITH wl AS (
          MAX(is_serverless)              AS is_serverless,
          ROUND(SUM(list_cost), 0)        AS untagged_cost
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
   HAVING {untag_expr} AND SUM(list_cost) > 0
 )
@@ -808,8 +915,8 @@ FROM wl
 LEFT JOIN {SUGGESTIONS_TABLE} s
   ON s.workload_id = wl.workload_id AND s.product = wl.product
 ORDER BY wl.untagged_cost DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 # ----------------------------------------------------------------------------
@@ -821,10 +928,17 @@ LIMIT {limit}
 # chosen key, has a real (non-"unknown") suggestion, and confidence >= cutoff.
 # ----------------------------------------------------------------------------
 
-def _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces):
-    """Shared CTE: untagged workloads with a confident, real suggestion."""
+def _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces, bag):
+    """Shared CTE: untagged workloads with a confident, real suggestion.
+
+    Appends its bind params to the caller-supplied `bag` (so the caller can add
+    its own params for the SELECT tail and pass one merged dict to the driver).
+    Returns just the SQL text (the `WITH … cand AS (…)` prefix)."""
     # A workload is "untagged for this key" if the chosen key is absent.
-    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS)
+    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    handled = _not_already_handled(tag_key, "wl.product", "wl.workload_id", bag)
+    conf = bag.add(float(min_confidence), "conf")
     return f"""
 WITH wl AS (
   SELECT product, workload_id,
@@ -833,7 +947,7 @@ WITH wl AS (
          MAX(is_serverless) AS is_serverless,
          SUM(list_cost)     AS cost
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
   HAVING {untag_expr} AND SUM(list_cost) > 0
 ),
@@ -846,26 +960,27 @@ cand AS (
     ON s.workload_id = wl.workload_id AND s.product = wl.product
   WHERE s.suggested_cost_center IS NOT NULL
     AND lower(s.suggested_cost_center) <> 'unknown'
-    AND s.confidence >= {float(min_confidence)}
+    AND s.confidence >= {conf}
     -- Only surface workloads the writer can actually tag; policy-governed
     -- products (Apps, serverless SQL, …) would be enqueued then skipped
     -- UNSUPPORTED and reappear next time. Filter them out here.
     AND {_taggable_predicate('wl.product', 'wl.is_serverless')}
     -- Don't double-tag: skip workloads already tagged/in-flight for this key.
     -- The summary snapshot lags a live write by up to a day, so check the queue.
-    AND {_not_already_handled(tag_key, 'wl.product', 'wl.workload_id')}
+    AND {handled}
 )"""
 
 
 def suggestions_bulk_impact(tag_key, min_confidence, days, workspaces=None):
     """Aggregate impact of enqueuing all confident suggestions for `tag_key`."""
-    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
-    return cte + """
+    bag = _Bag()
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces, bag)
+    return Query(cte + """
 SELECT COUNT(*)                              AS workloads,
        ROUND(SUM(cost), 0)                   AS cost,
        COUNT(DISTINCT suggested_cost_center) AS distinct_values
 FROM cand
-"""
+""", bag.params)
 
 
 def policy_governed_impact(tag_key, min_confidence, days, workspaces=None):
@@ -873,14 +988,17 @@ def policy_governed_impact(tag_key, min_confidence, days, workspaces=None):
     the writer (Apps, serverless SQL, …). Surfaced so the UI can explain why they
     aren't in the apply list instead of silently dropping them — they need a
     budget/tag policy, not a per-resource write."""
-    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS)
-    return f"""
+    bag = _Bag()
+    untag_expr = _missing_keys_predicate([tag_key], _AGG_KEYS, bag)
+    where = _where(days, workspaces, bag)
+    conf = bag.add(float(min_confidence), "conf")
+    return Query(f"""
 WITH wl AS (
   SELECT product, workload_id,
          MAX(is_serverless) AS is_serverless,
          SUM(list_cost)     AS cost
   FROM {SUMMARY_TABLE}
-  WHERE {_where(days, workspaces)}
+  WHERE {where}
   GROUP BY product, workload_id
   HAVING {untag_expr} AND SUM(list_cost) > 0
 )
@@ -891,15 +1009,16 @@ JOIN {SUGGESTIONS_TABLE} s
   ON s.workload_id = wl.workload_id AND s.product = wl.product
 WHERE s.suggested_cost_center IS NOT NULL
   AND lower(s.suggested_cost_center) <> 'unknown'
-  AND s.confidence >= {float(min_confidence)}
+  AND s.confidence >= {conf}
   AND NOT {_taggable_predicate('wl.product', 'wl.is_serverless')}
-"""
+""", bag.params)
 
 
 def suggestions_bulk_breakdown(tag_key, min_confidence, days, workspaces=None, limit=50):
     """Per-suggested-value coverage, so the human sees WHAT would be assigned."""
-    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
-    return cte + f"""
+    bag = _Bag()
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces, bag)
+    return Query(cte + f"""
 SELECT suggested_cost_center AS value,
        COUNT(*)              AS workloads,
        ROUND(SUM(cost), 0)   AS cost,
@@ -907,16 +1026,17 @@ SELECT suggested_cost_center AS value,
 FROM cand
 GROUP BY suggested_cost_center
 ORDER BY cost DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 def suggestions_bulk_list(tag_key, min_confidence, days, workspaces=None, limit=100):
     """The CONCRETE per-workload list: exactly which workloads get tagged and with
     what value. This is what a human needs to see before clicking apply — one row
     per workload, highest-cost first, showing the tag value the AI would set."""
-    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
-    return cte + f"""
+    bag = _Bag()
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces, bag)
+    return Query(cte + f"""
 SELECT product,
        workload_id,
        workspace_id,
@@ -927,8 +1047,8 @@ SELECT product,
        ROUND(confidence, 2)      AS confidence
 FROM cand
 ORDER BY cost DESC
-LIMIT {limit}
-"""
+LIMIT {int(limit)}
+""", bag.params)
 
 
 def enqueue_from_suggestions_sql(batch_id, requested_by, tag_key, min_confidence,
@@ -943,35 +1063,36 @@ def enqueue_from_suggestions_sql(batch_id, requested_by, tag_key, min_confidence
     batch are skipped — this is how the "rules first, AI for the rest" auto-tag
     flow avoids double-tagging a workload a rule already covered.
     """
-    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces)
+    bag = _Bag()
+    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces, bag)
     exclude = ""
     if exclude_batch_id:
         exclude = f"""
   AND NOT EXISTS (
     SELECT 1 FROM {QUEUE_TABLE} q
-    WHERE q.batch_id = {_sql_str(exclude_batch_id)}
-      AND q.tag_key = {_sql_str(tag_key)}
+    WHERE q.batch_id = {bag.add(exclude_batch_id, 'excl')}
+      AND q.tag_key = {bag.add(tag_key, 'key')}
       AND q.workload_id = cand.workload_id
       AND q.product = cand.product
   )"""
-    return f"""
+    return Query(f"""
 INSERT INTO {QUEUE_TABLE}
   (batch_id, enqueued_at, requested_by, workspace_id, product, workload_id,
    workload_name, is_serverless, tag_key, tag_value, list_cost, status, attempts)
 {cte}
 SELECT
-  {_sql_str(batch_id)}      AS batch_id,
-  current_timestamp()       AS enqueued_at,
-  {_sql_str(requested_by)}  AS requested_by,
+  {bag.add(batch_id, 'batch')}      AS batch_id,
+  current_timestamp()               AS enqueued_at,
+  {bag.add(requested_by, 'by')}     AS requested_by,
   workspace_id, product, workload_id, workload_name, is_serverless,
-  {_sql_str(tag_key)}       AS tag_key,
-  suggested_cost_center     AS tag_value,
-  cost                      AS list_cost,
-  'PENDING'                 AS status,
-  0                         AS attempts
+  {bag.add(tag_key, 'key')}         AS tag_key,
+  suggested_cost_center             AS tag_value,
+  cost                              AS list_cost,
+  'PENDING'                         AS status,
+  0                                 AS attempts
 FROM cand
 WHERE 1=1{exclude}
-"""
+""", bag.params)
 
 
 # --------------------------------------------------------------------- inventory (Phase 1 live scan)

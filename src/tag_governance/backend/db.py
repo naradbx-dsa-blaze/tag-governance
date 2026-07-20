@@ -17,12 +17,33 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 log = logging.getLogger("tag_governance.db")
 
 _conn = None
 _lock = threading.Lock()
+
+
+@dataclass
+class Query:
+    """A SQL string plus its NAMED bind parameters.
+
+    Lets a query-builder function return both together while call sites stay
+    `db.run_query(queries.foo(...))` — run_query/run_exec accept either a plain
+    str (static queries) or a Query (dynamic, parameterized ones). Keeping the two
+    together prevents the params from drifting away from the SQL that needs them.
+    """
+    sql: str
+    params: dict = field(default_factory=dict)
+
+
+def _split(sql_or_query):
+    """Normalize a str-or-Query into (sql_text, params_or_None)."""
+    if isinstance(sql_or_query, Query):
+        return sql_or_query.sql, (sql_or_query.params or None)
+    return sql_or_query, None
 
 
 def _http_path() -> str:
@@ -83,13 +104,22 @@ def _looks_like_conn_error(e: Exception) -> bool:
         "reset", "eof", "unauthenticated", "token"))
 
 
-def _run(sql_text: str, fn):
-    """Execute fn(cursor) with one reconnect retry on a connection-type failure."""
+def _run(sql_text: str, fn, parameters=None):
+    """Execute fn(cursor) with one reconnect retry on a connection-type failure.
+
+    parameters: optional dict of NAMED bind parameters (e.g. {"days": 30}). When
+    given, values are sent as server-side typed parameter markers (:name) — the
+    driver handles quoting/typing, so user input never lands in the SQL text.
+    This is the injection-safe path used by the dynamic (user-input) queries.
+    """
     for attempt in (1, 2):
         conn = get_connection(force_new=(attempt == 2))
         try:
             with conn.cursor() as cur:
-                cur.execute(sql_text)
+                if parameters:
+                    cur.execute(sql_text, parameters)
+                else:
+                    cur.execute(sql_text)
                 return fn(cur)
         except Exception as e:  # noqa: BLE001
             if attempt == 1 and _looks_like_conn_error(e):
@@ -98,19 +128,26 @@ def _run(sql_text: str, fn):
             raise
 
 
-def run_query(sql_text: str) -> list[dict]:
-    """Run a read query and return a list of dict rows (JSON-friendly)."""
+def run_query(sql_or_query, parameters=None) -> list[dict]:
+    """Run a read query and return a list of dict rows (JSON-friendly).
+
+    Accepts a plain SQL str (static queries) or a Query (carries its own named
+    params). An explicit `parameters` dict overrides a Query's params if both
+    are given (rare)."""
+    sql_text, qparams = _split(sql_or_query)
     def _read(cur):
         cols = [c[0] for c in cur.description]
         return [{c: _coerce(v) for c, v in zip(cols, r)} for r in cur.fetchall()]
-    return _run(sql_text, _read)
+    return _run(sql_text, _read, parameters or qparams)
 
 
-def run_exec(sql_text: str) -> int:
-    """Run a write statement (INSERT/DELETE/MERGE). Returns affected rows or -1."""
+def run_exec(sql_or_query, parameters=None) -> int:
+    """Run a write statement (INSERT/DELETE/MERGE). Returns affected rows or -1.
+    Accepts a str or a Query (see run_query)."""
+    sql_text, qparams = _split(sql_or_query)
     def _exec(cur):
         try:
             return cur.rowcount if cur.rowcount is not None else -1
         except Exception:  # noqa: BLE001
             return -1
-    return _run(sql_text, _exec)
+    return _run(sql_text, _exec, parameters or qparams)
