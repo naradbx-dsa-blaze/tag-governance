@@ -7,7 +7,27 @@ sync:
 
 artifacts:
   default:
-    build: apx build
+    # apx build regenerates .build/app.yml and has been seen to strip the runtime
+    # `env:` block (DATABRICKS_WAREHOUSE_ID etc.) -> blank dashboard. ensure_app_env.py
+    # verifies it survived and re-injects it from source (or fails loudly) so a
+    # future apx version can't silently ship a blank app.
+    build: apx build && python3 ensure_app_env.py
+
+# Re-assert the app SP's grants on every deploy. The app runs as its own service
+# principal, which needs CAN_USE on the warehouse + UC read/write on the schema.
+# Those objects are pre-existing (not bundle-managed), so a redeploy or SP
+# re-provision can silently drop the grants -> every query 500s -> blank KPIs.
+# This idempotent hook closes that gap so nobody has to remember grant_app_sp.sh.
+# It is best-effort: `|| true` keeps a deploy from failing if the caller lacks
+# admin rights (they can still run grant_app_sp.sh by hand — see README).
+scripts:
+  # Re-assert the app SP grants after deploy. Logic lives in postdeploy_grant.sh
+  # because DAB scripts forbid ${...} interpolation (both ${var.*} and bash
+  # ${VAR:-default}); the wrapper does the env defaulting. Override per customer
+  # target via TG_GRANT_PROFILE / TG_GRANT_SCHEMA / TG_GRANT_WAREHOUSE.
+  postdeploy:
+    content: |
+      bash postdeploy_grant.sh
 
 # Same vars as the original bundle — customer overrides these per target.
 variables:

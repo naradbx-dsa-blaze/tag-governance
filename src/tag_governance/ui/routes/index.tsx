@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   useOverview, useAiPreview, useBatches, useNotTaggable, useCapabilities,
   useInventory, useRulePreview, useTagSelected, useManualTag, useRollback,
@@ -40,6 +40,31 @@ function useControls() {
   return { tagKey, setTagKey, days, setDays };
 }
 
+// Probes /api/health on load. If the app can't reach the warehouse (the classic
+// blank-KPI cause — app SP missing CAN_USE, or a stripped app.yml env block), we
+// show a loud, actionable error instead of an empty dashboard. Uses plain fetch
+// so it works even before the typed hook is regenerated from the OpenAPI schema.
+function HealthBanner() {
+  const [h, setH] = useState<{ ok: boolean; detail?: string } | null>(null);
+  useEffect(() => {
+    fetch("/api/health")
+      .then((r) => (r.ok ? r.json() : { ok: false, detail: `Health check HTTP ${r.status}` }))
+      .then(setH)
+      .catch((e) => setH({ ok: false, detail: String(e) }));
+  }, []);
+  if (!h || h.ok) return null;
+  return (
+    <div className="rounded-lg border border-red-500/50 bg-red-500/10 p-4 text-sm">
+      <div className="font-semibold text-red-600 dark:text-red-400">
+        ⚠️ The dashboard can’t load data
+      </div>
+      <p className="mt-1 text-muted-foreground">
+        {h.detail || "The app can’t reach its SQL warehouse. KPIs will be blank until this is fixed."}
+      </p>
+    </div>
+  );
+}
+
 function App() {
   const c = useControls();
   const [mode, setMode] = useState<"ai" | "rules" | "manual">("ai");
@@ -59,6 +84,7 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-6xl space-y-8 px-8 py-8">
+        <HealthBanner />
         {/* controls */}
         <div className="flex flex-wrap items-end gap-6">
           <div>

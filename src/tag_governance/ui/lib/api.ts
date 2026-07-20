@@ -30,6 +30,11 @@ export interface BatchesOut {
 export interface HTTPValidationError {
     detail?: ValidationError[];
 }
+export interface HealthOut {
+    detail?: string | null;
+    ok: boolean;
+    warehouse_id?: string | null;
+}
 export interface ManualTagBody {
     dry_run?: boolean;
     is_serverless?: boolean;
@@ -372,6 +377,58 @@ export function useFieldValuesSuspense<TData = {
     return useSuspenseQuery({
         queryKey: fieldValuesKey(options?.params),
         queryFn: ()=>fieldValues(options?.params),
+        ...options?.query
+    });
+}
+export const health = async (options?: RequestInit): Promise<{
+    data: HealthOut;
+}> =>{
+    const res = await fetch("/api/health", {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const healthKey = ()=>{
+    return [
+        "/api/health"
+    ] as const;
+};
+export function useHealth<TData = {
+    data: HealthOut;
+}>(options?: {
+    query?: Omit<UseQueryOptions<{
+        data: HealthOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: healthKey(),
+        queryFn: ()=>health(),
+        ...options?.query
+    });
+}
+export function useHealthSuspense<TData = {
+    data: HealthOut;
+}>(options?: {
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: HealthOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: healthKey(),
+        queryFn: ()=>health(),
         ...options?.query
     });
 }

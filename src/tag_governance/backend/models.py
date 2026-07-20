@@ -13,6 +13,14 @@ class VersionOut(BaseModel):
         return cls(version=__version__)
 
 
+class HealthOut(BaseModel):
+    """Result of the /health probe: whether the app can reach the warehouse, and
+    if not, a human-readable reason the UI can show instead of blank KPIs."""
+    ok: bool
+    warehouse_id: str | None = None
+    detail: str | None = None
+
+
 # --- Read models (loose dict rows from the warehouse; typed at the edges) ---
 class OverviewOut(BaseModel):
     days: int

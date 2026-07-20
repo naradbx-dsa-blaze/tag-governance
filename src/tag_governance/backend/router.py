@@ -9,9 +9,9 @@ from fastapi.responses import JSONResponse
 
 from .core import Dependencies, create_router
 from .models import (
-    AutoTagBody, BatchBody, BatchesOut, ManualTagBody, OverviewOut, PreviewOut,
-    RowsOut, RulePreviewBody, RulePreviewOut, RunOut, TagSelectedBody, ValuesOut,
-    VersionOut, WhoAmIOut,
+    AutoTagBody, BatchBody, BatchesOut, HealthOut, ManualTagBody, OverviewOut,
+    PreviewOut, RowsOut, RulePreviewBody, RulePreviewOut, RunOut, TagSelectedBody,
+    ValuesOut, VersionOut, WhoAmIOut,
 )
 
 # The framework-agnostic logic modules (siblings on sys.path via __init__).
@@ -64,6 +64,32 @@ def _gate(request: Request, dry_run: bool, action: str):
 @router.get("/version", response_model=VersionOut, operation_id="version")
 async def version():
     return VersionOut.from_metadata()
+
+
+@router.get("/health", response_model=HealthOut, operation_id="health")
+def health():
+    """Liveness + warehouse-connectivity probe. The UI calls this first: instead
+    of showing blank KPIs when the app can't reach the warehouse, it surfaces the
+    real reason. The single most common cause is the app service principal missing
+    CAN_USE on the warehouse (grants aren't bundle-managed — see grant_app_sp.sh),
+    which manifests as a SQL open_session RequestError before any query runs."""
+    wid = os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    if not wid:
+        return HealthOut(ok=False, detail=(
+            "DATABRICKS_WAREHOUSE_ID is not set. The app.yml env block is missing "
+            "or was stripped by an `apx build`. Redeploy with the env block present."))
+    try:
+        db.run_query("SELECT 1")
+        return HealthOut(ok=True, warehouse_id=wid)
+    except Exception as e:  # noqa: BLE001 — the whole point is to report the failure
+        msg = f"{type(e).__name__}: {e}"
+        hint = ""
+        low = msg.lower()
+        if "request" in low or "open_session" in low or "unauthenticated" in low or "403" in low:
+            hint = (" — the app service principal likely lacks CAN_USE on warehouse "
+                    f"{wid}. Run grant_app_sp.sh (now also a postdeploy hook).")
+        log.warning("health check failed: %s", msg)
+        return HealthOut(ok=False, warehouse_id=wid, detail=f"Cannot reach the SQL warehouse.{hint}")
 
 
 @router.get("/whoami", response_model=WhoAmIOut, operation_id="whoami")

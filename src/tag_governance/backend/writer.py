@@ -100,20 +100,26 @@ def _write_job(client, workload_id: str, name: str, key: str, value: str | None,
         return WriteResult.ok(old, value, noop=True)
     if dry_run:
         return WriteResult.ok(old, value, dry_run=True)
-    # Two write modes, picked by whether we're SETTING or REMOVING a key:
-    #  - SET (value is not None): jobs.update with ONLY tags in new_settings. This
-    #    is a PARTIAL merge — it changes nothing but the tags map, so the owner's
-    #    schedule/tasks/clusters/params are untouched. Safest for tagging jobs we
-    #    don't own. (Verified: update preserves all other settings on a live job.)
-    #  - REMOVE (value is None, i.e. rollback): update MERGES and can't drop a key,
-    #    so we fall back to jobs.reset (full settings REPLACE) with the complete
-    #    settings and only .tags swapped, which sets tags to exactly `merged`.
+    # Always use jobs.update (a PARTIAL update touching only the tags field) — the
+    # owner's schedule/tasks/clusters/params/environments are untouched. We never
+    # use jobs.reset: reset does a FULL settings REPLACE and fails on jobs with a
+    # serverless `environments` spec ("Either base environment or version must be
+    # provided"), which silently broke rollback of tagged serverless jobs.
+    #
+    # The catch: jobs.update MERGES the tags map, so passing a reduced map does NOT
+    # drop a key. To REMOVE a key we must first clear the whole tags field with
+    # fields_to_remove=["tags"], then re-set the keepers in the SAME call. For a
+    # plain SET we just merge our map in.
     from databricks.sdk.service.jobs import JobSettings
     if value is not None:
         client.jobs.update(job_id=job_id, new_settings=JobSettings(tags=merged))
+    elif merged:
+        # rollback but other tags remain: clear + restore only the keepers.
+        client.jobs.update(job_id=job_id, fields_to_remove=["tags"],
+                           new_settings=JobSettings(tags=merged))
     else:
-        settings.tags = merged
-        client.jobs.reset(job_id=job_id, new_settings=settings)
+        # rollback of the only tag: drop the whole tags field.
+        client.jobs.update(job_id=job_id, fields_to_remove=["tags"])
     return WriteResult.ok(old, value)
 
 
