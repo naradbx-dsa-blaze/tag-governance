@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type ReactElement } from "react";
 import {
   useOverview, useAiPreview, useBatches, useNotTaggable, useCapabilities,
   useInventory, useRulePreview, useTagSelected, useManualTag, useRollback,
@@ -28,6 +28,74 @@ const money = (v: unknown) => {
 };
 const num = (v: unknown) => Number(v ?? 0);
 type Row = Record<string, unknown>;
+
+// Days since a YYYY-MM-DD date string (for the "latest / recency" filter+sort).
+const daysAgo = (v: unknown): number => {
+  if (!v) return Infinity;
+  const t = Date.parse(String(v));
+  if (isNaN(t)) return Infinity;
+  return Math.floor((Date.now() - t) / 86_400_000);
+};
+
+// Shared filter+sort over a preview's workload rows. Used by the AI-suggestion
+// and rule modes (NOT manual — that's one workload at a time). Because both modes
+// APPLY the rows they display (via tag-selected), filtering the view here also
+// filters exactly what gets tagged — no separate enqueue query needed. Returns the
+// control bar element + the filtered/sorted rows.
+type WLFilter = { minCost: number; sinceDays: number; nameLike: string;
+                  sortBy: "cost" | "latest" | "name" };
+// Each returned row carries `_i` = its index in the ORIGINAL rows array, so the
+// caller's vals/checked maps (keyed by original index) keep working after filtering.
+function useWorkloadFilter(rows: Row[]): { bar: ReactElement; rows: Row[] } {
+  const [f, setF] = useState<WLFilter>({ minCost: 0, sinceDays: 0, nameLike: "", sortBy: "cost" });
+  const nl = f.nameLike.trim().toLowerCase();
+  const filtered = rows
+    .map((w, _i) => ({ ...w, _i }))
+    .filter((w) => num(w.cost) >= f.minCost)
+    .filter((w) => f.sinceDays === 0 || daysAgo(w.last_seen) <= f.sinceDays)
+    .filter((w) => !nl || String(w.workload_name ?? w.workload_id).toLowerCase().includes(nl))
+    .sort((a, b) => {
+      if (f.sortBy === "cost") return num(b.cost) - num(a.cost);
+      if (f.sortBy === "latest") return daysAgo(a.last_seen) - daysAgo(b.last_seen);
+      return String(a.workload_name ?? "").localeCompare(String(b.workload_name ?? ""));
+    });
+  const bar = (
+    <div className="flex flex-wrap items-end gap-3 rounded-md border bg-muted/30 p-3 text-xs">
+      <div>
+        <label className="mb-1 block font-semibold text-muted-foreground">Workload name contains</label>
+        <Input value={f.nameLike} onChange={(e) => setF({ ...f, nameLike: e.target.value })}
+          placeholder="filter by name…" className="h-8 w-44" />
+      </div>
+      <div>
+        <label className="mb-1 block font-semibold text-muted-foreground">Min cost ($ DBU)</label>
+        <select value={f.minCost} onChange={(e) => setF({ ...f, minCost: Number(e.target.value) })}
+          className="h-8 rounded-md border bg-background px-2">
+          {[0, 10, 100, 1000, 10000].map((v) => <option key={v} value={v}>{v === 0 ? "any" : money(v)}</option>)}
+        </select>
+      </div>
+      <div>
+        <label className="mb-1 block font-semibold text-muted-foreground">Active in last</label>
+        <select value={f.sinceDays} onChange={(e) => setF({ ...f, sinceDays: Number(e.target.value) })}
+          className="h-8 rounded-md border bg-background px-2">
+          {[0, 7, 14, 30].map((v) => <option key={v} value={v}>{v === 0 ? "any time" : `${v} days`}</option>)}
+        </select>
+      </div>
+      <div>
+        <label className="mb-1 block font-semibold text-muted-foreground">Sort by</label>
+        <select value={f.sortBy} onChange={(e) => setF({ ...f, sortBy: e.target.value as WLFilter["sortBy"] })}
+          className="h-8 rounded-md border bg-background px-2">
+          <option value="cost">Highest cost</option>
+          <option value="latest">Most recent</option>
+          <option value="name">Name (A–Z)</option>
+        </select>
+      </div>
+      <span className="ml-auto self-center text-muted-foreground">
+        {filtered.length} of {rows.length} shown
+      </span>
+    </div>
+  );
+  return { bar, rows: filtered };
+}
 
 // After an apply, jump to the batches list so the user sees the progress bar fill.
 const scrollToBatches = () =>
@@ -395,13 +463,16 @@ function AiMode({ tagKey, days, onResult }: ModeProps) {
       : { kind: "info", html: `<b>${num(imp.workloads).toLocaleString()}</b> workloads (${money(imp.cost)}) — edit any AI value, then apply.` });
   };
 
+  // Filter/sort the previewed rows; we apply exactly what's shown here.
+  const { bar, rows: shown } = useWorkloadFilter(rows);
+
   const doApply = async () => {
-    const workloads = rows.map((w, i) => ({
+    const workloads = shown.map((w) => ({
       workload_id: w.workload_id, product: w.product, workspace_id: w.workspace_id,
       workload_name: w.workload_name, is_serverless: w.is_serverless,
-      tag_value: (vals[i] ?? "").trim(), cost: w.cost,
+      tag_value: (vals[w._i as number] ?? "").trim(), cost: w.cost,
     })).filter((w) => w.tag_value);
-    if (!workloads.length) return onResult({ kind: "warn", html: "No values to apply." });
+    if (!workloads.length) return onResult({ kind: "warn", html: "No values to apply (check your filters)." });
     if (!dry && !confirm(`Apply tags for REAL to ${workloads.length} workload(s)?`)) return;
     const res = await apply.mutateAsync({ tag_key: tagKey, workloads, dry_run: dry });
     const d = res.data;
@@ -430,33 +501,38 @@ function AiMode({ tagKey, days, onResult }: ModeProps) {
       </div>
       {rows.length > 0 && (
         <>
+          {bar}
           <div className="max-h-80 overflow-auto rounded-md border">
             <Table>
               <TableHeader><TableRow>
                 <TableHead>Workload</TableHead><TableHead>Product</TableHead>
-                <TableHead className="text-right">Cost</TableHead>
+                <TableHead className="text-right">Cost</TableHead><TableHead>Last active</TableHead>
                 <TableHead>Set value (editable)</TableHead><TableHead className="text-right">Conf</TableHead>
               </TableRow></TableHeader>
               <TableBody>
-                {rows.map((w, i) => (
+                {shown.map((w) => {
+                  const i = w._i as number;
+                  return (
                   <TableRow key={i}>
                     <TableCell className="max-w-52 truncate">{String(w.workload_name ?? w.workload_id)}</TableCell>
                     <TableCell>{String(w.product)}</TableCell>
                     <TableCell className="text-right tabular-nums">{money(w.cost)}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{String(w.last_seen ?? "—")}</TableCell>
                     <TableCell>
                       <Input value={vals[i] ?? ""} onChange={(e) => setVals({ ...vals, [i]: e.target.value })}
                         className="h-8 w-40" />
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{String(w.confidence)}</TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </div>
           <label className="flex items-center gap-2 text-sm">
             <Checkbox checked={dry} onCheckedChange={(v) => setDry(!!v)} /> Dry run only (writes nothing)
           </label>
-          <Button onClick={doApply} disabled={apply.isPending}>2️⃣ Apply to these workloads</Button>
+          <Button onClick={doApply} disabled={apply.isPending}>2️⃣ Apply to {shown.length} shown workload(s)</Button>
         </>
       )}
     </div>
@@ -490,13 +566,18 @@ function RulesMode({ tagKey, days, onResult }: ModeProps) {
     onResult({ kind: "info", html: `Matches <b>${num(imp.matched_count).toLocaleString()}</b> of ${num(imp.total_untagged).toLocaleString()} untagged (${money(imp.matched_cost)}). Uncheck any that don't belong; edit values.` });
   };
 
+  // Filter/sort the matched rows; apply respects both the filter AND the checkboxes.
+  const { bar, rows: shown } = useWorkloadFilter(rows);
+
   const doApply = async () => {
-    const workloads = rows.map((w, i) => ({
-      workload_id: w.workload_id, product: w.product, workspace_id: w.workspace_id,
-      workload_name: w.workload_name, is_serverless: w.is_serverless,
-      tag_value: (vals[i] ?? "").trim(), cost: w.cost,
-    })).filter((_, i) => checked[i]).filter((w) => w.tag_value);
-    if (!workloads.length) return onResult({ kind: "warn", html: "No workloads checked." });
+    const workloads = shown
+      .filter((w) => checked[w._i as number] ?? true)
+      .map((w) => ({
+        workload_id: w.workload_id, product: w.product, workspace_id: w.workspace_id,
+        workload_name: w.workload_name, is_serverless: w.is_serverless,
+        tag_value: (vals[w._i as number] ?? "").trim(), cost: w.cost,
+      })).filter((w) => w.tag_value);
+    if (!workloads.length) return onResult({ kind: "warn", html: "No workloads checked (or all filtered out)." });
     if (!dry && !confirm(`Apply tags for REAL to ${workloads.length} workload(s)?`)) return;
     const res = await apply.mutateAsync({ tag_key: tagKey, workloads, dry_run: dry });
     const d = res.data;
@@ -538,25 +619,30 @@ function RulesMode({ tagKey, days, onResult }: ModeProps) {
       </div>
       {rows.length > 0 && (
         <>
+          {bar}
           <div className="max-h-80 overflow-auto rounded-md border">
             <Table>
               <TableHeader><TableRow>
                 <TableHead className="w-8"></TableHead><TableHead>Workload</TableHead>
                 <TableHead>Product</TableHead><TableHead>Owner</TableHead>
-                <TableHead className="text-right">Cost</TableHead><TableHead>Set value</TableHead>
+                <TableHead className="text-right">Cost</TableHead><TableHead>Last active</TableHead><TableHead>Set value</TableHead>
               </TableRow></TableHeader>
               <TableBody>
-                {rows.map((w, i) => (
+                {shown.map((w) => {
+                  const i = w._i as number;
+                  return (
                   <TableRow key={i}>
                     <TableCell><Checkbox checked={checked[i] ?? true} onCheckedChange={(v) => setChecked({ ...checked, [i]: !!v })} /></TableCell>
                     <TableCell className="max-w-44 truncate">{String(w.workload_name ?? w.workload_id)}</TableCell>
                     <TableCell>{String(w.product)}</TableCell>
                     <TableCell className="text-muted-foreground">{String(w.owner ?? "—")}</TableCell>
                     <TableCell className="text-right tabular-nums">{money(w.cost)}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{String(w.last_seen ?? "—")}</TableCell>
                     <TableCell><Input value={vals[i] ?? ""} className="h-8 w-40"
                       onChange={(e) => setVals({ ...vals, [i]: e.target.value })} /></TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </div>

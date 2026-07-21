@@ -32,7 +32,7 @@
         "@opentelemetry/exporter-logs-otlp-http": "^0.220.0",
         "@opentelemetry/resources": "^2.9.0",
         "@opentelemetry/sdk-logs": "^0.220.0",
-        "@tailwindcss/vite": "^0.0.0-insiders.35a3e9c",
+        "@tailwindcss/vite": "^0.0.0-insiders.f861d5c",
         "@tanstack/router-generator": "^1.167.19",
         "@tanstack/router-plugin": "^1.168.20",
         "@types/node": "25.0.3",

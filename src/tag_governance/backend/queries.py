@@ -526,6 +526,7 @@ WITH wl AS (
   SELECT workload_id, product,
          MAX(workspace_id) AS workspace_id, MAX(workload_name) AS workload_name, MAX(owner) AS owner,
          MAX(is_serverless) AS is_serverless,
+         MAX(usage_date) AS last_seen,
          {untag} AS is_untagged,
          SUM(list_cost) AS cost
   FROM {SUMMARY_TABLE}
@@ -534,7 +535,7 @@ WITH wl AS (
 ),
 matched AS (
   SELECT workload_id, product, workspace_id, workload_name, owner,
-         is_serverless, ROUND(cost,0) AS cost,
+         is_serverless, ROUND(cost,0) AS cost, last_seen,
          CASE
 {ladder}
            ELSE -1 END AS first_rule
@@ -545,7 +546,7 @@ matched AS (
     AND {handled}
 )
 SELECT workload_id, product, workspace_id, workload_name, owner,
-       is_serverless, cost,
+       is_serverless, cost, last_seen,
        CASE first_rule
 {val_ladder}
        END AS new_tag_value
@@ -973,6 +974,7 @@ WITH wl AS (
          MAX(workspace_id)  AS workspace_id,
          MAX(workload_name) AS workload_name,
          MAX(is_serverless) AS is_serverless,
+         MAX(usage_date)    AS last_seen,
          SUM(list_cost)     AS cost
   FROM {SUMMARY_TABLE}
   WHERE {where}
@@ -981,7 +983,7 @@ WITH wl AS (
 ),
 cand AS (
   SELECT wl.product, wl.workload_id, wl.workspace_id, wl.workload_name,
-         wl.is_serverless, wl.cost,
+         wl.is_serverless, wl.cost, wl.last_seen,
          s.suggested_cost_center, s.confidence
   FROM wl
   JOIN {SUGGESTIONS_TABLE} s
@@ -1071,6 +1073,7 @@ SELECT product,
        is_serverless,
        workload_name,
        ROUND(cost, 0)            AS cost,
+       last_seen,
        suggested_cost_center     AS new_tag_value,
        ROUND(confidence, 2)      AS confidence
 FROM cand
