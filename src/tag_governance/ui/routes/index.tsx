@@ -53,7 +53,12 @@ function useWorkloadFilter(rows: Row[]): { bar: ReactElement; rows: Row[] } {
     .map((w, _i) => ({ ...w, _i }))
     .filter((w) => num(w.cost) >= f.minCost)
     .filter((w) => f.sinceDays === 0 || daysAgo(w.last_seen) <= f.sinceDays)
-    .filter((w) => !nl || String(w.workload_name ?? w.workload_id).toLowerCase().includes(nl))
+    // Match the text against workload name AND owner, so typing a person's name
+    // narrows to their workloads (owner is only present on rule-mode rows; on AI
+    // rows it's absent and simply doesn't match — harmless).
+    .filter((w) => !nl
+      || String(w.workload_name ?? w.workload_id).toLowerCase().includes(nl)
+      || String(w.owner ?? "").toLowerCase().includes(nl))
     .sort((a, b) => {
       if (f.sortBy === "cost") return num(b.cost) - num(a.cost);
       if (f.sortBy === "latest") return daysAgo(a.last_seen) - daysAgo(b.last_seen);
@@ -62,9 +67,9 @@ function useWorkloadFilter(rows: Row[]): { bar: ReactElement; rows: Row[] } {
   const bar = (
     <div className="flex flex-wrap items-end gap-3 rounded-md border bg-muted/30 p-3 text-xs">
       <div>
-        <label className="mb-1 block font-semibold text-muted-foreground">Workload name contains</label>
+        <label className="mb-1 block font-semibold text-muted-foreground">Name or owner contains</label>
         <Input value={f.nameLike} onChange={(e) => setF({ ...f, nameLike: e.target.value })}
-          placeholder="filter by name…" className="h-8 w-44" />
+          placeholder="filter by name or owner…" className="h-8 w-44" />
       </div>
       <div>
         <label className="mb-1 block font-semibold text-muted-foreground">Min cost ($ DBU)</label>
