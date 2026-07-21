@@ -63,6 +63,34 @@ choose the right tag, and applies it safely and reversibly.
 You'll need the [Databricks CLI](https://docs.databricks.com/dev-tools/cli/) and
 admin rights in the target workspace.
 
+### Who can run this? 👥
+
+There are three separate roles — you don't need to be an account admin:
+
+| Role | Who | Why |
+|---|---|---|
+| **Deploy the app** | **Workspace admin** | Deploying the bundle + granting the app's service principal (`CAN_USE` on the warehouse, read/write on the schema) needs workspace-admin rights. One-time. |
+| **View + preview** | **Any user** with access to the app | Reading spend, previewing AI/rule matches, and dry-runs are open to everyone (unless you lock the app down). No special rights. |
+| **Apply tags for real** | **Whoever the app is restricted to** (default: anyone) | Live writes can be gated to a group via the `admin_group` variable. And critically — see below — a live tag only lands if the **writer's identity can manage that resource**. |
+
+**The catch that decides what actually gets tagged:** the writer job runs as the
+app's **service principal**, and it can only tag resources that identity is allowed
+to manage:
+
+- **A regular user / workspace-local SP** → tags resources **it owns**; others come
+  back `PermissionDenied`.
+- **A workspace admin (or admin service principal)** → tags **everything in that
+  workspace**.
+- **Across multiple workspaces** → needs an **account service principal** (set
+  `account_sp_scope`); without it the app tags only its home workspace.
+
+Policy-governed products (Apps, serverless SQL, AI Gateway, …) are never
+API-taggable regardless of who runs it — they attribute via a budget policy.
+
+> **Rule of thumb:** deploy as a workspace admin and let the app run as an admin
+> service principal, so it can tag the whole workspace. Account admin is only
+> needed to set up the account SP for cross-workspace tagging.
+
 **1. Point the app at your workspace.** In `databricks.yml`, set the two values under
 `variables` (or pass them with `--var` at deploy time):
 
@@ -98,11 +126,9 @@ Open the app URL from the deploy output and you're live.
 
 ### Notes
 
-- **Who the writer runs as decides what it can tag.** A regular user can only tag
-  resources they own; a **workspace admin** (or admin service principal) can tag
-  everything. Policy-governed products are never API-taggable regardless.
 - **Multiple workspaces?** Set `account_sp_scope` to a secret scope holding an account
   service principal's OAuth creds to tag across all workspaces. Otherwise it tags the
-  home workspace only.
+  home workspace only. (See "Who can run this?" above.)
 - **Restrict live writes** to a group by setting the `admin_group` variable (default
-  `OPEN` = anyone can write, fine for a demo).
+  `OPEN` = anyone who can open the app can apply tags — fine for a demo, set a real
+  group for production).
