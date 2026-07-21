@@ -163,6 +163,32 @@ def _write_cluster(client, workload_id: str, name: str, key: str, value: str | N
     return WriteResult.ok(old, value)
 
 
+# instance_pools.edit is ALSO a full-replace and requires instance_pool_name +
+# node_type_id, so — like clusters — reflect the whole existing spec back and
+# change only custom_tags. Pool tags PROPAGATE to the VMs launched from the pool,
+# so this sets the default attribution for pooled compute.
+_POOL_EDIT_FIELDS = (
+    "instance_pool_name", "node_type_id", "idle_instance_autotermination_minutes",
+    "max_capacity", "min_idle_instances", "remote_disk_throughput",
+    "total_initial_remote_disk_size",
+)
+
+
+def _write_pool(client, workload_id: str, name: str, key: str, value: str | None,
+                dry_run: bool = False) -> WriteResult:
+    p = client.instance_pools.get(instance_pool_id=workload_id)
+    current = dict(p.custom_tags or {})
+    old, merged, noop = _apply_merge(current, key, value)
+    if noop:
+        return WriteResult.ok(old, value, noop=True)
+    if dry_run:
+        return WriteResult.ok(old, value, dry_run=True)
+    spec = {f: getattr(p, f) for f in _POOL_EDIT_FIELDS if getattr(p, f, None) is not None}
+    spec["custom_tags"] = merged
+    client.instance_pools.edit(instance_pool_id=workload_id, **spec)
+    return WriteResult.ok(old, value)
+
+
 def _write_warehouse(client, workload_id: str, name: str, key: str, value: str | None,
                      dry_run: bool = False) -> WriteResult:
     from databricks.sdk.service.sql import EndpointTags, EndpointTagPair
@@ -264,6 +290,7 @@ def _write_pipeline(client, workload_id: str, name: str, key: str, value: str,
 _WRITERS = {
     "JOBS": _write_job,
     "ALL_PURPOSE": _write_cluster,
+    "POOL": _write_pool,              # instance pools (list-API driven, not billed)
     "SQL": _write_warehouse,          # non-serverless warehouses only (see attempt_write)
     "DATABASE": _write_warehouse,
     "MODEL_SERVING": _write_serving,

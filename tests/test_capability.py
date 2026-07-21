@@ -23,7 +23,7 @@ def test_api_taggable_matches_writer_set():
     api = tuple(p for p in cap.api_taggable_products()
                 if not (cap.get(p) and (cap.get(p).ui_only or cap.get(p).serverless_differs)))
     assert set(api) == {
-        "JOBS", "ALL_PURPOSE", "MODEL_SERVING", "LAKEBASE", "VECTOR_SEARCH", "DATABASE"}
+        "JOBS", "ALL_PURPOSE", "POOL", "MODEL_SERVING", "LAKEBASE", "VECTOR_SEARCH", "DATABASE"}
 
 
 def test_policy_reasons_cover_governed_plus_sql():

@@ -148,10 +148,25 @@ def _scan_pipelines(client):
         }
 
 
+def _scan_pools(client):
+    # Instance pools aren't billed as their own workload (cost rolls up under the
+    # jobs/clusters using them), so they only surface via this list scan — not the
+    # billing summary. Pool tags propagate to pooled VMs, so tagging them sets the
+    # default attribution for that compute.
+    for p in client.instance_pools.list():
+        yield {
+            "workload_id": p.instance_pool_id,
+            "workload_name": p.instance_pool_name,
+            "owner": None,  # pools have no creator field in the list payload
+            "tags": dict(p.custom_tags or {}), "tag_read_ok": True, "read_error": None,
+        }
+
+
 # product key -> enumerator. Only products with a real read/list path.
 _SCANNERS = {
     "JOBS": _scan_jobs,
     "ALL_PURPOSE": _scan_clusters,
+    "POOL": _scan_pools,
     "SQL": _scan_warehouses,
     "MODEL_SERVING": _scan_serving,
     "DLT": _scan_pipelines,

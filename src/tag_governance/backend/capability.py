@@ -66,6 +66,15 @@ CAPABILITIES: dict[str, Capability] = {
         write_path="clusters.edit(custom_tags=…) [full-spec GET→MERGE→PUT]",
         tag_method="ALL_PURPOSE", direct_tag=True, create_time_only=False,
         policy_driven=False, ui_only=False, rollback=True, fallback=DIRECT),
+    "POOL": Capability(
+        product="POOL", label="Instance pools",
+        read_path="instance_pools.get(id).custom_tags",
+        write_path="instance_pools.edit(custom_tags=…) [full-spec GET→MERGE→PUT]",
+        tag_method="POOL", direct_tag=True, create_time_only=False,
+        policy_driven=False, ui_only=False, rollback=True, fallback=DIRECT,
+        reason="Instance pools aren't billed as their own workload (cost rolls up "
+               "under the jobs/clusters using them), so they surface via the live "
+               "asset scan, not the billing summary. Pool tags propagate to pooled VMs."),
     "SQL": Capability(
         product="SQL", label="SQL warehouses",
         read_path="warehouses.get(id).tags.custom_tags",
