@@ -361,6 +361,7 @@ WITH wl AS (
          MAX(workspace_id)  AS workspace_id,
          MAX(workload_name) AS workload_name,
          MAX(owner)         AS owner,
+         MAX(is_serverless) AS is_serverless,
          product,
          {untag} AS is_untagged,
          SUM(list_cost)     AS cost
@@ -368,9 +369,16 @@ WITH wl AS (
   WHERE {where}
   GROUP BY product, workload_id
 ),
--- Exclude workloads already tagged/in-flight for this key in the live queue: the
--- summary snapshot lags a write by up to a day, so filter on the queue too.
-untagged AS (SELECT * FROM wl WHERE is_untagged AND cost > 0 AND {handled}),
+-- Exclude workloads we can't actually tag (policy-governed / no-API) AND ones
+-- already tagged/in-flight/failed in the queue — the SAME filters bulk_rule_sample
+-- and the enqueue path apply, so matched_count equals what's actually shown and
+-- tagged (previously impact over-counted vs an empty sample, which was confusing).
+untagged AS (
+  SELECT * FROM wl
+  WHERE is_untagged AND cost > 0
+    AND {_taggable_predicate('product', 'is_serverless')}
+    AND {handled}
+),
 matched AS (
   SELECT *,
          CASE

@@ -563,7 +563,10 @@ function RulesMode({ tagKey, days, onResult }: ModeProps) {
     setVals(Object.fromEntries(wl.map((w, i) => [i, String(w.new_tag_value ?? "")])));
     setChecked(Object.fromEntries(wl.map((_, i) => [i, true])));
     const imp = (res.data.impact ?? {}) as Row;
-    onResult({ kind: "info", html: `Matches <b>${num(imp.matched_count).toLocaleString()}</b> of ${num(imp.total_untagged).toLocaleString()} untagged (${money(imp.matched_cost)}). Uncheck any that don't belong; edit values.` });
+    const matched = num(imp.matched_count);
+    onResult(matched === 0
+      ? { kind: "warn", html: `No <b>taggable</b> workloads match this rule. Any matches may be already tagged, or a type this app can't tag directly (Apps, serverless SQL, etc. — see "Tagged a different way").` }
+      : { kind: "info", html: `Matches <b>${matched.toLocaleString()}</b> taggable workloads (${money(imp.matched_cost)}). Uncheck any that don't belong; edit values.` });
   };
 
   // Filter/sort the matched rows; apply respects both the filter AND the checkboxes.
