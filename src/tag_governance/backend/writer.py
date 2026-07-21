@@ -123,6 +123,28 @@ def _write_job(client, workload_id: str, name: str, key: str, value: str | None,
     return WriteResult.ok(old, value)
 
 
+# clusters.edit is a FULL-REPLACE: any field not passed is reset to its default.
+# So we must reflect the ENTIRE existing spec back and change only custom_tags —
+# passing just a few fields silently wipes spark_conf, autotermination_minutes,
+# init_scripts, policy, etc. (verified: it disabled auto-termination and cleared
+# spark_conf on a real cluster). We forward every edit()-accepted attribute
+# straight off the ClusterDetails object (which already holds the correctly-TYPED
+# SDK sub-objects — as_dict() would give plain dicts that edit() rejects), and
+# override only custom_tags.
+_CLUSTER_EDIT_FIELDS = (
+    "apply_policy_default_values", "autoscale", "autotermination_minutes",
+    "aws_attributes", "azure_attributes", "cluster_log_conf", "cluster_name",
+    "data_security_mode", "docker_image", "driver_instance_pool_id",
+    "driver_node_type_flexibility", "driver_node_type_id", "enable_elastic_disk",
+    "enable_local_disk_encryption", "gcp_attributes", "init_scripts",
+    "instance_pool_id", "is_single_node", "kind", "node_type_id", "num_workers",
+    "policy_id", "remote_disk_throughput", "runtime_engine", "single_user_name",
+    "spark_conf", "spark_env_vars", "spark_version", "ssh_public_keys",
+    "total_initial_remote_disk_size", "use_ml_runtime",
+    "worker_node_type_flexibility", "workload_type",
+)
+
+
 def _write_cluster(client, workload_id: str, name: str, key: str, value: str | None,
                    dry_run: bool = False) -> WriteResult:
     c = client.clusters.get(cluster_id=workload_id)
@@ -132,15 +154,12 @@ def _write_cluster(client, workload_id: str, name: str, key: str, value: str | N
         return WriteResult.ok(old, value, noop=True)
     if dry_run:
         return WriteResult.ok(old, value, dry_run=True)
-    # clusters.edit requires the full spec; carry forward the identifying fields.
-    client.clusters.edit(
-        cluster_id=workload_id,
-        spark_version=c.spark_version,
-        node_type_id=c.node_type_id,
-        num_workers=c.num_workers,
-        autoscale=c.autoscale,
-        custom_tags=merged,
-    )
+    # Forward every present, edit()-accepted attribute (as its typed SDK object),
+    # overriding ONLY custom_tags, so no other setting is reset to a default.
+    spec = {f: getattr(c, f) for f in _CLUSTER_EDIT_FIELDS
+            if getattr(c, f, None) is not None}
+    spec["custom_tags"] = merged  # merged may be {} on a full removal, which clears tags
+    client.clusters.edit(cluster_id=workload_id, **spec)
     return WriteResult.ok(old, value)
 
 
