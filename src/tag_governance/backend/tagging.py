@@ -53,6 +53,11 @@ PRODUCT_PLANS: dict[str, ResourcePlan] = {
         "All-Purpose Cluster", "cluster_id",
         "clusters.edit(cluster_id, custom_tags={...})",
     ),
+    "POOL": ResourcePlan(
+        "Instance Pool", "instance_pool_id",
+        "instance_pools.edit(instance_pool_id, custom_tags={...})",
+        serverless_note="Pool tags propagate to the VMs launched from the pool.",
+    ),
     "INTERACTIVE": ResourcePlan(
         "All-Purpose Cluster", "cluster_id",
         "clusters.edit(cluster_id, custom_tags={...})",
