@@ -288,85 +288,6 @@ ORDER BY untagged_cost DESC
 """, bag.params)
 
 
-def by_workspace(days, tag_keys, workspaces=None):
-    """Untagged spend per workspace — the multi-workspace view."""
-    bag = _Bag()
-    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
-    where = _where(days, workspaces, bag)
-    return Query(f"""
-WITH workload AS (
-  SELECT workspace_id, workload_id,
-         SUM(list_cost) AS cost,
-         {untag} AS is_untagged
-  FROM {SUMMARY_TABLE}
-  WHERE {where}
-  GROUP BY workspace_id, workload_id
-),
-agg AS (
-  SELECT workspace_id,
-         ROUND(SUM(cost), 0)                                       AS total_cost,
-         ROUND(SUM(CASE WHEN is_untagged THEN cost ELSE 0 END), 0) AS untagged_cost,
-         ROUND(100.0 * SUM(CASE WHEN is_untagged THEN cost ELSE 0 END) / NULLIF(SUM(cost), 0), 1) AS pct_untagged,
-         COUNT(DISTINCT CASE WHEN is_untagged THEN workload_id END) AS untagged_workloads
-  FROM workload GROUP BY workspace_id
-)
-SELECT a.workspace_id,
-       COALESCE(ws.workspace_name, a.workspace_id) AS workspace_name,
-       a.total_cost, a.untagged_cost, a.pct_untagged, a.untagged_workloads
-FROM agg a
-LEFT JOIN system.access.workspaces_latest ws ON a.workspace_id = ws.workspace_id
-WHERE a.total_cost > 0
-ORDER BY a.untagged_cost DESC
-""", bag.params)
-
-
-def leaderboard(days, tag_keys, workspaces=None, limit=200):
-    bag = _Bag()
-    where = _where(days, workspaces, bag)
-    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
-    return Query(f"""
-SELECT product,
-       workload_id,
-       MAX(workspace_id)                           AS workspace_id,
-       MAX(workload_name)                          AS workload_name,
-       MAX(owner)                                  AS owner,
-       MAX(is_serverless)                          AS is_serverless,
-       ROUND(SUM(list_cost), 0)                    AS untagged_cost
-FROM {SUMMARY_TABLE}
-WHERE {where}
-GROUP BY product, workload_id
-HAVING {untag_expr} AND SUM(list_cost) > 0
-ORDER BY untagged_cost DESC
-LIMIT {int(limit)}
-""", bag.params)
-
-
-def untagged_workloads(days, tag_keys, workspaces=None, limit=10000):
-    """ALL untagged workloads with the attributes bulk rules match on.
-
-    Returns one row per workload with owner / workspace / product / name / cost,
-    so rule matching + conflict detection can run client-side over the full set.
-    """
-    bag = _Bag()
-    where = _where(days, workspaces, bag)
-    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
-    return Query(f"""
-SELECT product,
-       workload_id,
-       MAX(workspace_id)                AS workspace_id,
-       MAX(workload_name)               AS workload_name,
-       MAX(owner)                       AS owner,
-       MAX(is_serverless)               AS is_serverless,
-       ROUND(SUM(list_cost), 0)         AS untagged_cost
-FROM {SUMMARY_TABLE}
-WHERE {where}
-GROUP BY product, workload_id
-HAVING {untag_expr} AND SUM(list_cost) > 0
-ORDER BY untagged_cost DESC
-LIMIT {int(limit)}
-""", bag.params)
-
-
 def _rule_sql_predicate(rule, bag=None):
     """SQL boolean for one rule's match condition over the workload aggregate.
 
@@ -467,39 +388,6 @@ FROM matched
 """, bag.params)
 
 
-def bulk_rule_per_rule(days, tag_keys, rules, workspaces=None):
-    """Per-rule first-match coverage (how many workloads each rule newly tags)."""
-    valid = [r for r in rules if r.get("value") and r.get("tags")]
-    if not valid:
-        return None
-    bag = _Bag()
-    preds = [_rule_sql_predicate(r, bag) for r in valid]
-    ladder = "\n".join(f"      WHEN {p} THEN {i}" for i, p in enumerate(preds))
-    untag = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
-    where = _where(days, workspaces, bag)
-    handled = _not_already_handled(tag_keys[0], "wl.product", "wl.workload_id", bag)
-    return Query(f"""
-WITH wl AS (
-  SELECT workload_id, product,
-         {untag} AS is_untagged,
-         SUM(list_cost) AS cost,
-         MAX(owner) AS owner, MAX(workspace_id) AS workspace_id, MAX(workload_name) AS workload_name
-  FROM {SUMMARY_TABLE}
-  WHERE {where}
-  GROUP BY product, workload_id
-),
-matched AS (
-  SELECT cost, CASE
-{ladder}
-           ELSE -1 END AS first_rule
-  FROM wl WHERE is_untagged AND cost > 0 AND {handled}
-)
-SELECT first_rule, COUNT(*) AS workloads, ROUND(SUM(cost),0) AS cost
-FROM matched WHERE first_rule >= 0
-GROUP BY first_rule ORDER BY first_rule
-""", bag.params)
-
-
 def bulk_rule_sample(days, tag_keys, rules, workspaces=None, limit=200):
     """The CONCRETE per-workload list a rule set would tag: name, product, owner,
     cost, AND the exact value each gets (from the first rule that matches). This is
@@ -554,41 +442,6 @@ FROM matched
 WHERE first_rule >= 0
 ORDER BY cost DESC
 LIMIT {int(limit)}
-""", bag.params)
-
-
-def workspace_options(days):
-    """All workspaces in the table (for the sidebar picker), ranked by spend, with names."""
-    return f"""
-WITH s AS (
-  SELECT workspace_id, ROUND(SUM(list_cost), 0) AS cost
-  FROM {SUMMARY_TABLE}
-  WHERE usage_date >= current_date() - INTERVAL {int(days)} DAYS
-  GROUP BY workspace_id
-)
-SELECT s.workspace_id,
-       COALESCE(ws.workspace_name, s.workspace_id) AS workspace_name,
-       s.cost
-FROM s
-LEFT JOIN system.access.workspaces_latest ws ON s.workspace_id = ws.workspace_id
-ORDER BY s.cost DESC
-"""
-
-
-def distinct_tag_keys(days, workspaces=None):
-    """All tag keys currently in use — to seed the picker."""
-    bag = _Bag()
-    where = _where(days, workspaces, bag)
-    return Query(f"""
-SELECT tag_key, COUNT(DISTINCT workload_id) AS workloads
-FROM (
-  SELECT workload_id, explode(tag_keys) AS tag_key
-  FROM {SUMMARY_TABLE}
-  WHERE {where}
-)
-GROUP BY tag_key
-ORDER BY workloads DESC
-LIMIT 50
 """, bag.params)
 
 
@@ -815,34 +668,6 @@ def count_queue_rows(batch_id):
                  bag.params)
 
 
-def batch_status(batch_id):
-    """Per-status counts + cost for one batch — headline for the Batches tab."""
-    bag = _Bag()
-    return Query(f"""
-SELECT status,
-       COUNT(*)                          AS rows,
-       COUNT(DISTINCT workload_id)       AS workloads,
-       ROUND(SUM(list_cost), 0)          AS cost
-FROM {QUEUE_TABLE}
-WHERE batch_id = {bag.add(batch_id,'b')}
-GROUP BY status
-ORDER BY status
-""", bag.params)
-
-
-def batch_rows(batch_id, limit=500):
-    """Per-workload rows for a batch, with status + any error (for the detail table)."""
-    bag = _Bag()
-    return Query(f"""
-SELECT product, workload_id, workload_name, tag_key, tag_value,
-       status, last_error, ROUND(list_cost, 0) AS cost
-FROM {QUEUE_TABLE}
-WHERE batch_id = {bag.add(batch_id,'b')}
-ORDER BY list_cost DESC NULLS LAST
-LIMIT {int(limit)}
-""", bag.params)
-
-
 def recent_batches(limit=25):
     """Most recent batches with rollup status, for the Batches & Rollback tab."""
     return f"""
@@ -898,55 +723,9 @@ LIMIT {int(limit)}
 """, bag.params)
 
 
-def audit_for_batch(batch_id, limit=500):
-    """Audit history for a batch — the old→new record, for verify + rollback view."""
-    bag = _Bag()
-    return Query(f"""
-SELECT executed_at, action, product, workload_id, tag_key,
-       old_value, new_value, status, error
-FROM {AUDIT_TABLE}
-WHERE batch_id = {bag.add(batch_id,'b')}
-ORDER BY executed_at DESC
-LIMIT {int(limit)}
-""", bag.params)
-
-
 # ============================================================================
 # Advisory agent suggestions (ai_query hints) — read-only join for the UI
 # ============================================================================
-
-def suggestions_join(days, tag_keys, workspaces=None, limit=200):
-    """Leaderboard of untagged workloads WITH the advisory ai_query suggestion.
-
-    LEFT JOINs the suggestions table so workloads without a suggestion still show.
-    The suggestion is a HINT only — the human decides whether to act on it.
-    """
-    bag = _Bag()
-    untag_expr = _missing_keys_predicate(tag_keys, _AGG_KEYS, bag)
-    where = _where(days, workspaces, bag)
-    return Query(f"""
-WITH wl AS (
-  SELECT product, workload_id,
-         MAX(workspace_id)               AS workspace_id,
-         MAX(workload_name)              AS workload_name,
-         MAX(owner)                      AS owner,
-         MAX(is_serverless)              AS is_serverless,
-         ROUND(SUM(list_cost), 0)        AS untagged_cost
-  FROM {SUMMARY_TABLE}
-  WHERE {where}
-  GROUP BY product, workload_id
-  HAVING {untag_expr} AND SUM(list_cost) > 0
-)
-SELECT wl.product, wl.workload_id, wl.workspace_id, wl.workload_name, wl.owner,
-       wl.is_serverless, wl.untagged_cost,
-       s.suggested_cost_center, s.confidence, s.rationale
-FROM wl
-LEFT JOIN {SUGGESTIONS_TABLE} s
-  ON s.workload_id = wl.workload_id AND s.product = wl.product
-ORDER BY wl.untagged_cost DESC
-LIMIT {int(limit)}
-""", bag.params)
-
 
 # ----------------------------------------------------------------------------
 # Bulk tag FROM AI suggestions (threshold + one-click). The agent already
@@ -1041,22 +820,6 @@ WHERE s.suggested_cost_center IS NOT NULL
   AND lower(s.suggested_cost_center) <> 'unknown'
   AND s.confidence >= {conf}
   AND NOT {_taggable_predicate('wl.product', 'wl.is_serverless')}
-""", bag.params)
-
-
-def suggestions_bulk_breakdown(tag_key, min_confidence, days, workspaces=None, limit=50):
-    """Per-suggested-value coverage, so the human sees WHAT would be assigned."""
-    bag = _Bag()
-    cte = _suggestion_candidates_cte(tag_key, min_confidence, days, workspaces, bag)
-    return Query(cte + f"""
-SELECT suggested_cost_center AS value,
-       COUNT(*)              AS workloads,
-       ROUND(SUM(cost), 0)   AS cost,
-       ROUND(MIN(confidence), 2) AS min_conf
-FROM cand
-GROUP BY suggested_cost_center
-ORDER BY cost DESC
-LIMIT {int(limit)}
 """, bag.params)
 
 

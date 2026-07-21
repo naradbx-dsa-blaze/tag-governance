@@ -204,25 +204,6 @@ def enqueue_single(plan: "TagPlan", workspace_id: str, is_serverless: bool = Fal
             "workload": plan.workload_name or plan.workload_id, "tags": plan.tags}
 
 
-def enqueue_from_suggestions(batch_id: str, tag_key: str, min_confidence: float,
-                             days: int, workspaces=None,
-                             exclude_batch_id: str | None = None) -> int | None:
-    """Enqueue confident AI suggestions for `tag_key` into an EXISTING batch.
-
-    Reuses the caller's batch_id (so rules + AI land in one rollback-able unit).
-    Returns rows inserted (None if the driver reports no rowcount).
-    """
-    import db
-    import queries
-    sql = queries.enqueue_from_suggestions_sql(
-        batch_id=batch_id, requested_by=_requested_by(), tag_key=tag_key,
-        min_confidence=min_confidence, days=days, workspaces=workspaces,
-        exclude_batch_id=exclude_batch_id,
-    )
-    inserted = db.run_exec(sql)
-    return inserted if (inserted is not None and inserted >= 0) else None
-
-
 def tag_selected(tag_key: str, workloads: list) -> dict:
     """Enqueue an EXPLICIT, user-selected list of workloads (each with its own
     value) as one batch. This is the "review the rule's matches, uncheck the ones
